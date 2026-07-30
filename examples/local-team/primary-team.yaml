@@ -1,0 +1,32 @@
+# This example demonstrates composing teams from local files: a lead agent
+# can list another team's YAML file in `sub_agents`. Only that team's default
+# agent (the one named "root", or the first declared) is exposed to the
+# parent — here under the "specialists" alias — and it keeps its own
+# sub-agents, so it orchestrates its own team behind the scenes.
+#
+# Without an alias, `- ./secondary-team.yaml` would be exposed as
+# "secondary-team" (the file name without extension). Relative paths are
+# resolved against this file's directory. Local HCL files (.hcl) work too.
+#
+# Delegation stays synchronous: `transfer_task` blocks the primary lead until
+# the secondary lead returns its result.
+#
+# Instead of declaring `sub_agents` below, use the dedicated primary file:
+#   docker agent run ./examples/local-team/primary-cli.yaml \
+#     --team "Research team=./secondary-team.yaml"
+
+models:
+  model:
+    provider: openai
+    model: gpt-4o
+
+agents:
+  root:
+    model: model
+    description: Primary lead that delegates specialist work to a second team
+    instruction: |
+      You coordinate the work. For any research or writing task, delegate to
+      the "specialists" sub-agent (the lead of a second team defined in
+      ./secondary-team.yaml), wait for its result, and present it to the user.
+    sub_agents:
+      - specialists:./secondary-team.yaml

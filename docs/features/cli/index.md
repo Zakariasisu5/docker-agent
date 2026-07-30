@@ -48,6 +48,8 @@ $ docker agent run [config] [message...] [flags]
 | `--json`                                | Output results as newline-delimited JSON (use with `--exec`)                                                                              |
 | `--hide-tool-calls`                     | Hide tool calls in the output                                                                                                             |
 | `--hide-tool-results`                   | Hide tool call results in the output                                                                                                      |
+| `--prompt-file <path>`                  | Append file contents to every agent prompt (repeatable)                                                                                    |
+| `--team <name=path>`                     | Attach a local YAML/HCL team to the primary lead (repeatable). The text before `=` is the TUI section title; a unique routing ID is generated separately. Not available with `--remote` or `--sandbox`. |
 | `--sandbox`                             | Run the agent inside a Docker sandbox (see [Sandbox](../../configuration/sandbox/index.md))                                     |
 | `--template <image>`                    | Template image for the sandbox (default: `docker/docker-agent-sbx-templates:latest`)                                                      |
 | `--sbx`                                 | Prefer the `sbx` CLI backend when available (default `true`; set `--sbx=false` to force `docker sandbox`)                                 |
@@ -84,6 +86,8 @@ $ docker agent run agent.yaml --model "dev=openai/gpt-4o,reviewer=anthropic/clau
 $ docker agent run agent.yaml --session -1  # resume last session
 $ docker agent run agent.yaml --session -1 --session-read-only  # review last session without sending messages
 $ docker agent run agent.yaml --prompt-file ./context.md  # include file as context
+$ docker agent run primary.yaml --team "Research team=./secondary.yaml"
+$ docker agent run primary.yaml --team "Research team=./secondary.yaml" --team "QA team=./qa.hcl"
 
 # Add hooks from the command line
 $ docker agent run agent.yaml --hook-session-start "./scripts/setup-env.sh"

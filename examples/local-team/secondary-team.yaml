@@ -1,0 +1,30 @@
+# The secondary team imported by primary-team.yaml. Its default agent (root)
+# is the only agent exposed to the importing team; researcher and writer stay
+# private and keep reporting to this lead. The file is also a complete,
+# runnable team on its own:
+#
+#   docker agent run examples/local-team/secondary-team.yaml
+
+models:
+  model:
+    provider: openai
+    model: gpt-4o
+
+agents:
+  root:
+    model: model
+    description: Secondary team lead that orchestrates its own specialists
+    instruction: |
+      Split incoming tasks between your researcher and writer sub-agents,
+      then combine their output into a single answer.
+    sub_agents: [researcher, writer]
+
+  researcher:
+    model: model
+    description: Gathers facts and background information
+    instruction: Research the topic and return concise, factual notes.
+
+  writer:
+    model: model
+    description: Turns research notes into polished prose
+    instruction: Write a clear, well-structured answer from the notes you get.

@@ -255,6 +255,61 @@ External references in `handoffs` and `force_handoff` carry the same per-run cos
 >
 > See [`examples/sub-agents-from-registry.yaml`](https://github.com/docker/docker-agent/blob/main/examples/sub-agents-from-registry.yaml) for a complete example mixing local and external sub-agents.
 
+## External Teams from Local Files
+
+`sub_agents` also accepts local file paths (`.yaml`, `.yml`, or `.hcl`), resolved relative to the importing file. This lets you split a large system across files: only the referenced team's **default agent** (the one named `root`, or the first declared) is exposed to the parent — the rest of that team stays private and keeps reporting to its own lead.
+
+```yaml
+# primary-team.yaml
+agents:
+  root:
+    model: openai/gpt-5
+    description: Primary lead
+    instruction: Delegate specialist work to the secondary team lead.
+    sub_agents:
+      - specialists:./secondary-team.yaml # exposed as "specialists"
+```
+
+```yaml
+# secondary-team.yaml
+agents:
+  root:
+    model: openai/gpt-5
+    description: Secondary team lead
+    instruction: Coordinate your own specialists and report the result.
+    sub_agents: [researcher]
+
+  researcher:
+    model: openai/gpt-5
+    description: Researcher
+    instruction: Research topics and return concise notes.
+```
+
+The imported lead keeps its own `sub_agents` (here `researcher`), so it still orchestrates its own team. Without an alias, `- ./secondary-team.yaml` is exposed as `secondary-team` (the file name without extension). Delegation stays synchronous either way: the primary lead's `transfer_task` call blocks until the secondary lead returns its result.
+
+### Compose teams from the CLI
+
+The same relationship can be added at launch time without editing the primary YAML. Use the repeatable `--team` flag; the second positional argument remains a user message for backward compatibility.
+
+```bash
+docker agent run ./primary-team.yaml \
+  --team "Research team=./secondary-team.yaml"
+
+# Add more teams
+docker agent run ./primary-team.yaml \
+  --team "Research team=./secondary-team.yaml" \
+  --team "QA team=./qa-team.hcl"
+```
+
+`--team` accepts `Team name=path`, where the text before `=` is the human-readable TUI title. Paths may point to local `.yaml`, `.yml`, or `.hcl` files and resolve relative to the primary manifest. Routing IDs are generated separately, so the secondary lead keeps its normal display name (for example `root`) under the `Research team` title. This option is currently local-only and cannot be combined with `--remote` or `--sandbox`.
+
+The TUI keeps the usual agent cards and uses each team name as that card section's title. Imported members are shown under their lead so their activity is visible during nested transfers, but they have no shortcut and cannot be selected directly.
+
+Only the referenced team's agents are imported: an imported file must not declare top-level `permissions`, `budget`, `budgets`, or `runtime.safety` — those policies cannot be preserved across the import, so loading fails with an error asking you to declare them in the importing (main) manifest. Per-agent settings such as `agents.<name>.safety` travel with the agent and keep working.
+
+> [!TIP]
+> See [`examples/local-team/`](https://github.com/docker/docker-agent/tree/main/examples/local-team) for a runnable pair of files.
+
 ## Harness-Backed Sub-Agents
 
 Sub-agents can be backed by external coding CLIs — Claude Code, Codex, opencode, or pi — instead of a model API. Add a `harness:` block in place of a `model:` field to create a harness sub-agent:
