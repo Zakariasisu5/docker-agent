@@ -44,12 +44,14 @@ import (
 var defaultMaxTokens int64 = 32000
 
 type loadOptions struct {
-	workingDir       string
-	modelOverrides   []string
-	promptFiles      []string
-	toolsetRegistry  ToolsetRegistry
-	providerRegistry *provider.Registry
-	modelOpts        []options.Opt
+	workingDir        string
+	modelOverrides    []string
+	promptFiles       []string
+	externalTeams     []string
+	externalTeamNames map[string]string
+	toolsetRegistry   ToolsetRegistry
+	providerRegistry  *provider.Registry
+	modelOpts         []options.Opt
 }
 
 type Opt func(*loadOptions) error
@@ -78,6 +80,18 @@ func WithModelOverrides(overrides []string) Opt {
 func WithPromptFiles(files []string) Opt {
 	return func(opts *loadOptions) error {
 		opts.promptFiles = files
+		return nil
+	}
+}
+
+// WithExternalTeams adds local agent manifests as sub-teams of the primary
+// manifest's default agent. Each reference may use the same optional
+// "name:path" syntax as sub_agents; paths are resolved relative to the
+// primary manifest. This option is intended for the CLI's repeatable --team
+// flag and deliberately accepts local YAML/HCL files only.
+func WithExternalTeams(refs []string) Opt {
+	return func(opts *loadOptions) error {
+		opts.externalTeams = slices.Clone(refs)
 		return nil
 	}
 }
@@ -276,6 +290,7 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 	workingDir := runConfig.WorkingDir
 	parentDir := cmp.Or(agentSource.ParentDir(), workingDir)
 	configName := configNameFromSource(agentSource.Name())
+	primaryTeamName := "Primary team"
 	var agents []*agent.Agent
 	agentsByName := make(map[string]*agent.Agent)
 
@@ -287,6 +302,22 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 
 	globalHooks := runConfig.GlobalHooks
 	cliHooks := runConfig.CLIHooks()
+
+	// CLI-composed teams are appended to the primary/default lead before
+	// concrete agents and toolsets are built. That makes transfer_task
+	// injection follow exactly the same path as declarative sub_agents.
+	if len(loadOpts.externalTeams) > 0 {
+		primaryIndex := defaultAgentConfigIndex(cfg.Agents)
+		if primaryIndex < 0 {
+			return nil, errors.New("cannot attach external teams: primary manifest has no agents")
+		}
+		refs, names, err := mergeExternalTeamRefs(cfg.Agents[primaryIndex].SubAgents, loadOpts.externalTeams)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Agents[primaryIndex].SubAgents = refs
+		loadOpts.externalTeamNames = names
+	}
 
 	for _, agentConfig := range cfg.Agents {
 		// Merge CLI prompt files with agent config prompt files, deduplicating
@@ -304,6 +335,7 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 
 		opts := []agent.Opt{
 			agent.WithName(agentConfig.Name),
+			agent.WithTeamInfo(primaryTeamName, false, false),
 			agent.WithDescription(expander.Expand(ctx, agentConfig.Description, nil)),
 			agent.WithWelcomeMessage(expander.Expand(ctx, agentConfig.WelcomeMessage, nil)),
 			agent.WithAddDate(agentConfig.AddDate),
@@ -428,10 +460,11 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 	}
 
 	// Connect sub-agents and handoff agents.
-	// externalAgents caches agents loaded from external references (OCI/URL),
-	// keyed by the original reference string, to avoid loading the same
-	// external agent twice. This is kept separate from agentsByName to
-	// prevent external agents from shadowing locally-defined agents.
+	// externalAgents caches agents loaded from external references (OCI, URL,
+	// or local config file), keyed by the original reference string, to avoid
+	// loading the same external agent twice. This is kept separate from
+	// agentsByName to prevent external agents from shadowing locally-defined
+	// agents.
 	externalAgents := make(map[string]*agent.Agent)
 	for _, agentConfig := range cfg.Agents {
 		a, exists := agentsByName[agentConfig.Name]
@@ -439,7 +472,7 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 			continue
 		}
 
-		subAgents, err := resolveAgentRefs(ctx, agentConfig.SubAgents, agentsByName, externalAgents, &agents, runConfig, &loadOpts)
+		subAgents, err := resolveAgentRefs(ctx, agentConfig.SubAgents, agentsByName, externalAgents, &agents, parentDir, runConfig, &loadOpts)
 		if err != nil {
 			return nil, fmt.Errorf("agent '%s': resolving sub-agents: %w", agentConfig.Name, err)
 		}
@@ -447,7 +480,7 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 			agent.WithSubAgents(subAgents...)(a)
 		}
 
-		handoffs, err := resolveAgentRefs(ctx, agentConfig.Handoffs, agentsByName, externalAgents, &agents, runConfig, &loadOpts)
+		handoffs, err := resolveAgentRefs(ctx, agentConfig.Handoffs, agentsByName, externalAgents, &agents, parentDir, runConfig, &loadOpts)
 		if err != nil {
 			return nil, fmt.Errorf("agent '%s': resolving handoffs: %w", agentConfig.Name, err)
 		}
@@ -456,7 +489,7 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 		}
 
 		if agentConfig.ForceHandoff != "" {
-			targets, err := resolveAgentRefs(ctx, []string{agentConfig.ForceHandoff}, agentsByName, externalAgents, &agents, runConfig, &loadOpts)
+			targets, err := resolveAgentRefs(ctx, []string{agentConfig.ForceHandoff}, agentsByName, externalAgents, &agents, parentDir, runConfig, &loadOpts)
 			if err != nil {
 				return nil, fmt.Errorf("agent '%s': resolving force_handoff: %w", agentConfig.Name, err)
 			}
@@ -999,18 +1032,137 @@ func configNameFromSource(sourceName string) string {
 	return base + "-" + hex.EncodeToString(h[:4])
 }
 
+func defaultAgentConfigIndex(agents latest.Agents) int {
+	for i := range agents {
+		if agents[i].Name == "root" {
+			return i
+		}
+	}
+	if len(agents) > 0 {
+		return 0
+	}
+	return -1
+}
+
+// mergeExternalTeamRefs validates and appends CLI-composed local teams while
+// preventing ambiguous exposed names. Existing local agent names and external
+// refs on the lead reserve their exposed IDs.
+func mergeExternalTeamRefs(existing, extra []string) ([]string, map[string]string, error) {
+	merged := slices.Clone(existing)
+	teamNames := make(map[string]string, len(extra))
+	seenRef := make(map[string]struct{}, len(existing)+len(extra))
+	seenName := make(map[string]string, len(existing)+len(extra))
+	for _, ref := range existing {
+		seenRef[ref] = struct{}{}
+		name, _ := config.ParseExternalAgentRef(ref)
+		seenName[name] = ref
+	}
+	for _, input := range extra {
+		teamName, ref, err := parseExternalTeamSpec(input)
+		if err != nil {
+			return nil, nil, err
+		}
+		name, _ := config.ParseExternalAgentRef(ref)
+		if _, ok := seenRef[ref]; ok {
+			return nil, nil, fmt.Errorf("external team %q is already configured on the primary lead", input)
+		}
+		if previous, ok := seenName[name]; ok {
+			return nil, nil, fmt.Errorf("external team %q exposes duplicate agent ID %q already used by %q", input, name, previous)
+		}
+		seenRef[ref] = struct{}{}
+		seenName[name] = ref
+		teamNames[ref] = teamName
+		merged = append(merged, ref)
+	}
+	return merged, teamNames, nil
+}
+
+// parseExternalTeamSpec parses `Team name=path`. The display name and the
+// runtime agent ID are deliberately separate: an unaliased path receives a
+// stable slug ID, while the TUI title keeps the exact human-readable name.
+// The legacy `[alias:]path` form remains accepted.
+func parseExternalTeamSpec(input string) (teamName, ref string, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errors.New("external team must not be empty")
+	}
+	ref = input
+	if before, after, ok := strings.Cut(input, "="); ok {
+		teamName = strings.TrimSpace(before)
+		ref = strings.TrimSpace(after)
+		if teamName == "" || ref == "" {
+			return "", "", fmt.Errorf("external team %q must use 'Team name=path' with both values set", input)
+		}
+	}
+
+	exposedName, target := config.ParseExternalAgentRef(ref)
+	if !config.IsLocalConfigReference(target) {
+		return "", "", fmt.Errorf("external team %q must reference a local .yaml, .yml, or .hcl file", input)
+	}
+	if teamName == "" {
+		teamName = exposedName
+	}
+	// No explicit runtime alias was supplied on the right-hand side. Generate
+	// one from the team title so duplicate `root` leads never collide.
+	if target == ref {
+		id := teamAgentID(teamName)
+		if id == "" {
+			return "", "", fmt.Errorf("external team name %q does not produce a usable agent ID", teamName)
+		}
+		ref = id + ":" + ref
+	}
+	return teamName, ref, nil
+}
+
+func teamAgentID(name string) string {
+	var b strings.Builder
+	lastDash := false
+	for _, r := range strings.ToLower(name) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if b.Len() > 0 && !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// labelImportedTeam labels agents local to one imported manifest. Nested
+// imported leads already carry a different non-empty TeamName and keep it.
+func labelImportedTeam(imported *team.Team, lead *agent.Agent, name string) {
+	if imported == nil || lead == nil {
+		return
+	}
+	originalTeamName := lead.TeamName()
+	for _, memberName := range imported.AgentNames() {
+		member, err := imported.Agent(memberName)
+		if err != nil || member.TeamName() != originalTeamName {
+			continue
+		}
+		agent.WithTeamInfo(name, member == lead, member != lead)(member)
+	}
+}
+
 // resolveAgentRefs resolves a list of agent references to agent instances.
 // References that match a locally-defined agent name are looked up directly.
-// References that are external (OCI or URL) are loaded on-demand and cached
-// in externalAgents so the same reference isn't loaded twice.
-// External references may include an explicit name prefix ("name:ref") or
-// derive a short name from the reference (e.g. "myorg/review-pr" → "review-pr").
+// References that are external (OCI, URL, or local config file) are loaded
+// on-demand and cached in externalAgents so the same reference isn't loaded
+// twice. External references may include an explicit name prefix ("name:ref")
+// or derive a short name from the reference (e.g. "myorg/review-pr" →
+// "review-pr", "./secondary-team.yaml" → "secondary-team"). Relative local
+// file references resolve against parentDir, the importing config's directory.
 func resolveAgentRefs(
 	ctx context.Context,
 	refs []string,
 	agentsByName map[string]*agent.Agent,
 	externalAgents map[string]*agent.Agent,
 	agents *[]*agent.Agent,
+	parentDir string,
 	runConfig *config.RuntimeConfig,
 	loadOpts *loadOptions,
 ) ([]*agent.Agent, error) {
@@ -1039,17 +1191,24 @@ func resolveAgentRefs(
 			return nil, fmt.Errorf("external agent %q resolves to name %q which conflicts with agent %q", ref, agentName, existing.Name())
 		}
 
-		a, err := loadExternalAgent(ctx, externalRef, runConfig, loadOpts)
+		a, importedTeam, err := loadExternalAgent(ctx, externalRef, parentDir, runConfig, loadOpts)
 		if err != nil {
 			return nil, fmt.Errorf("loading %q: %w", externalRef, err)
 		}
 
-		// Rename the external agent so it doesn't collide with locally-defined
-		// agents. External agents resolve to their team's default agent (one
-		// explicitly named "root" if it exists, otherwise the first agent
-		// declared), which we may want to expose under a different name in
-		// the importing team.
+		// Rename the external lead and label its team for presentation. Only
+		// the lead joins the public parent registry; importedTeam's other local
+		// agents remain private and are reached through the lead's pointers.
+		teamDisplayName := agentName
+		if configured, ok := loadOpts.externalTeamNames[ref]; ok {
+			teamDisplayName = configured
+		}
+		originalLeadName := a.Name()
 		agent.WithName(agentName)(a)
+		if originalLeadName != agentName {
+			agent.WithDisplayName(originalLeadName)(a)
+		}
+		labelImportedTeam(importedTeam, a, teamDisplayName)
 
 		*agents = append(*agents, a)
 		externalAgents[ref] = a
@@ -1063,12 +1222,32 @@ func resolveAgentRefs(
 // This prevents infinite recursion when external agents reference each other.
 const maxExternalDepth = 10
 
-// loadExternalAgent loads an agent from an external reference (OCI or URL).
-// It resolves the reference, loads its config, and returns the default agent.
-func loadExternalAgent(ctx context.Context, ref string, runConfig *config.RuntimeConfig, loadOpts *loadOptions) (*agent.Agent, error) {
+// loadExternalAgent loads an agent from an external reference (OCI, URL, or
+// local config file). It resolves the reference, loads its config, and
+// returns the default agent (the one named "root" if it exists, otherwise the
+// first declared) with its own sub-agents still attached.
+func loadExternalAgent(ctx context.Context, ref, parentDir string, runConfig *config.RuntimeConfig, loadOpts *loadOptions) (*agent.Agent, *team.Team, error) {
 	depth := externalDepthFromContext(ctx)
 	if depth >= maxExternalDepth {
-		return nil, fmt.Errorf("maximum external agent nesting depth (%d) exceeded — check for circular references", maxExternalDepth)
+		return nil, nil, fmt.Errorf("maximum external agent nesting depth (%d) exceeded — check for circular references", maxExternalDepth)
+	}
+
+	isLocalFile := config.IsLocalConfigReference(ref)
+	if isLocalFile {
+		// Relative local file references resolve against the importing
+		// config's directory, not the process working directory, matching how
+		// other relative paths in agent configs behave.
+		if !filepath.IsAbs(ref) {
+			ref = filepath.Join(parentDir, ref)
+		}
+		// Fail circular chains of local files at the first repeat instead of
+		// re-initializing the whole chain until the depth cap trips.
+		chain := localChainFromContext(ctx)
+		cleaned := filepath.Clean(ref)
+		if slices.Contains(chain, cleaned) {
+			return nil, nil, fmt.Errorf("circular local team reference: %s", strings.Join(append(slices.Clone(chain), cleaned), " -> "))
+		}
+		ctx = contextWithLocalChain(ctx, append(slices.Clone(chain), cleaned))
 	}
 
 	// Tag references (including the implicit ":latest") are re-resolved against
@@ -1081,7 +1260,7 @@ func loadExternalAgent(ctx context.Context, ref string, runConfig *config.Runtim
 
 	source, err := config.Resolve(ref, runConfig.EnvProvider())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var opts []Opt
@@ -1097,12 +1276,54 @@ func loadExternalAgent(ctx context.Context, ref string, runConfig *config.Runtim
 		opts = append(opts, WithModelOptions(loadOpts.modelOpts...))
 	}
 
-	result, err := Load(contextWithExternalDepth(ctx, depth+1), source, runConfig, opts...)
+	result, err := LoadWithConfig(contextWithExternalDepth(ctx, depth+1), source, runConfig, opts...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return result.DefaultAgent()
+	// Only the imported team's default agent joins the parent team, so
+	// config-wide policies of a local team file would be silently dropped.
+	// Fail loudly instead of merging them: the semantics of combining two
+	// manifests' policies are ambiguous. Scoped to local file references so
+	// existing OCI/URL imports keep their current behaviour.
+	if isLocalFile {
+		if err := rejectUnpreservedTeamPolicies(ref, result); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	lead, err := result.Team.DefaultAgent()
+	if err != nil {
+		return nil, nil, err
+	}
+	return lead, result.Team, nil
+}
+
+// rejectUnpreservedTeamPolicies fails the import of a local team file whose
+// manifest declares top-level policies that cannot be preserved when only
+// its default agent is grafted onto the importing team: `permissions`, the
+// run-wide `budget`, named `budgets` (and per-agent budget references), and
+// `runtime.safety`. Agent-level settings (e.g. agents.<name>.safety) live on
+// the agent objects themselves and are unaffected.
+func rejectUnpreservedTeamPolicies(ref string, result *LoadResult) error {
+	var dropped []string
+	if p := result.Team.Permissions(); p != nil && !p.IsEmpty() {
+		dropped = append(dropped, "permissions")
+	}
+	if result.Budget != nil {
+		dropped = append(dropped, "budget")
+	}
+	if len(result.Budgets) > 0 || len(result.AgentBudgets) > 0 {
+		dropped = append(dropped, "budgets")
+	}
+	if result.Team.RuntimeSafety() != "" {
+		dropped = append(dropped, "runtime.safety")
+	}
+	if len(dropped) == 0 {
+		return nil
+	}
+	return fmt.Errorf("local team file %q declares top-level %s, which cannot be preserved when the file is imported as a sub-agent; declare these policies in the importing (main) manifest instead",
+		ref, strings.Join(dropped, ", "))
 }
 
 // contextKey is an unexported type for context keys defined in this package.
@@ -1110,6 +1331,13 @@ type contextKey int
 
 // externalDepthKey is the context key for tracking external agent loading depth.
 var externalDepthKey contextKey
+
+// localChainKey is the context key carrying the chain of local config file
+// paths (cleaned, importing-config-relative refs made absolute) currently
+// being loaded, root-most first. Each recursive load branches its own copy,
+// so diamond imports (two siblings importing the same file) stay legal while
+// genuine cycles are caught at the first repeated path.
+var localChainKey contextKey = 1
 
 func externalDepthFromContext(ctx context.Context) int {
 	if v, ok := ctx.Value(externalDepthKey).(int); ok {
@@ -1120,4 +1348,15 @@ func externalDepthFromContext(ctx context.Context) int {
 
 func contextWithExternalDepth(ctx context.Context, depth int) context.Context {
 	return context.WithValue(ctx, externalDepthKey, depth)
+}
+
+func localChainFromContext(ctx context.Context) []string {
+	if v, ok := ctx.Value(localChainKey).([]string); ok {
+		return v
+	}
+	return nil
+}
+
+func contextWithLocalChain(ctx context.Context, chain []string) context.Context {
+	return context.WithValue(ctx, localChainKey, chain)
 }

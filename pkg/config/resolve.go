@@ -239,13 +239,48 @@ func IsOCIReference(input string) bool {
 
 // isLocalFile checks if the input is a local file
 func isLocalFile(input string) bool {
-	ext := strings.ToLower(filepath.Ext(input))
 	// Check for known config file extensions or file descriptors
-	if ext == ".yaml" || ext == ".yml" || ext == ".hcl" || strings.HasPrefix(input, "/dev/fd/") {
+	if hasConfigFileExt(input) || strings.HasPrefix(input, "/dev/fd/") {
 		return true
 	}
 	// Check if it exists as a file on disk
 	return fileExists(input)
+}
+
+// hasConfigFileExt reports whether path ends with a known agent config file
+// extension (.yaml, .yml or .hcl).
+func hasConfigFileExt(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".yaml" || ext == ".yml" || ext == ".hcl"
+}
+
+// IsLocalConfigReference reports whether input references a local agent
+// config file: a relative or absolute path ending in .yaml, .yml or .hcl.
+// The check is purely syntactic — the file does not have to exist — so the
+// result never depends on the current directory's contents. A ":" is only
+// accepted as part of a Windows drive designator followed by a path
+// separator (e.g. "C:\agents\team.yaml"); any other colon means the input
+// may carry a "name:reference" prefix (including single-letter names like
+// "b:./team.yaml") or a URL scheme and is not a plain path.
+func IsLocalConfigReference(input string) bool {
+	if !hasConfigFileExt(input) {
+		return false
+	}
+	rest := input
+	if len(input) >= 3 && input[1] == ':' && isDriveLetter(input[0]) && isPathSeparator(input[2]) {
+		rest = input[2:]
+	}
+	return !strings.Contains(rest, ":")
+}
+
+// isDriveLetter reports whether c can be a Windows drive letter.
+func isDriveLetter(c byte) bool {
+	return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
+}
+
+// isPathSeparator reports whether c is a Windows or POSIX path separator.
+func isPathSeparator(c byte) bool {
+	return c == '\\' || c == '/'
 }
 
 func fileNameWithoutExt(path string) string {
@@ -255,9 +290,10 @@ func fileNameWithoutExt(path string) string {
 }
 
 // IsExternalReference reports whether the input is an external agent reference
-// (OCI image or URL) rather than a local agent name defined in the same config.
-// Local agent names never contain "/", so the slash check distinguishes them
-// from OCI references like "myorg/agent:tag" or "docker.io/org/agent:v1".
+// (OCI image, URL, or local config file path) rather than an agent name
+// defined in the same config. Agent names never contain "/" or a config file
+// extension, which distinguishes them from OCI references like
+// "myorg/agent:tag" and file paths like "./team.yaml".
 // It also handles the "name:ref" syntax (e.g. "reviewer:myorg/review-pr").
 func IsExternalReference(input string) bool {
 	_, ref := ParseExternalAgentRef(input)
@@ -266,11 +302,13 @@ func IsExternalReference(input string) bool {
 
 // ParseExternalAgentRef parses an external agent reference that may include an
 // explicit name prefix. The syntax is "name:reference" where name is a simple
-// identifier (no slashes) and reference is an OCI reference or URL.
+// identifier (no slashes) and reference is an OCI reference, URL, or local
+// config file path.
 //
 // If no explicit name is provided, the base name is derived from the reference:
 //   - OCI refs: last path segment without tag (e.g. "myorg/review-pr" → "review-pr")
 //   - URLs: filename without extension (e.g. "https://example.com/agent.yaml" → "agent")
+//   - local files: filename without extension (e.g. "./secondary-team.yaml" → "secondary-team")
 //
 // Examples:
 //
@@ -278,6 +316,7 @@ func IsExternalReference(input string) bool {
 //	ParseExternalAgentRef("myorg/review-pr") → ("review-pr", "myorg/review-pr")
 //	ParseExternalAgentRef("docker.io/myorg/myagent:v1") → ("myagent", "docker.io/myorg/myagent:v1")
 //	ParseExternalAgentRef("https://example.com/agent.yaml") → ("agent", "https://example.com/agent.yaml")
+//	ParseExternalAgentRef("specialists:./secondary-team.yaml") → ("specialists", "./secondary-team.yaml")
 func ParseExternalAgentRef(input string) (agentName, ref string) {
 	// If the whole input is already a valid external reference, derive the name
 	// from it without trying to split on ":".
@@ -306,7 +345,7 @@ func ParseExternalAgentRef(input string) (agentName, ref string) {
 // It is used by both IsExternalReference and ParseExternalAgentRef to avoid
 // circular dependencies.
 func isExternalRef(input string) bool {
-	return IsURLReference(input) || (strings.Contains(input, "/") && IsOCIReference(input))
+	return IsURLReference(input) || IsLocalConfigReference(input) || (strings.Contains(input, "/") && IsOCIReference(input))
 }
 
 // externalRefBaseName extracts a short agent name from an external reference.
@@ -315,10 +354,11 @@ func isExternalRef(input string) bool {
 //     "myorg/review-pr" → "review-pr"
 //     "docker.io/myorg/myagent:v1" → "myagent"
 //
-//   - URL: filename without extension
+//   - URL or local file: filename without extension
 //     "https://example.com/agent.yaml" → "agent"
+//     "./secondary-team.yaml" → "secondary-team"
 func externalRefBaseName(ref string) string {
-	if IsURLReference(ref) {
+	if IsURLReference(ref) || IsLocalConfigReference(ref) {
 		return fileNameWithoutExt(ref)
 	}
 

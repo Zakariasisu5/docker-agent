@@ -631,21 +631,21 @@
         },
         "sub_agents": {
           "type": "array",
-          "description": "List of sub-agents. Can be names of agents defined in this config, external references (OCI images like 'namespace/repo' or URLs), or named external references using 'name:reference' syntax (e.g. 'reviewer:myorg/review-pr'). External agents without an explicit name are named after their last path segment. Pin external OCI references to an immutable digest (e.g. 'namespace/repo@sha256:...') to serve them from cache; tag references (including the implicit ':latest') are re-resolved against the registry on every run, even when the sub-agent is never invoked.",
+          "description": "List of sub-agents. Can be names of agents defined in this config, external references (OCI images like 'namespace/repo', URLs, or local config file paths like './team.yaml'), or named external references using 'name:reference' syntax (e.g. 'reviewer:myorg/review-pr' or 'specialists:./team.yaml'). External agents without an explicit name are named after their last path segment (file references after the file name without extension). A local file reference (.yaml, .yml or .hcl, resolved relative to this config file) exposes only that team's default agent ('root' if present, otherwise the first declared), which keeps its own sub-agents so it orchestrates its own team; transfer_task blocks until it returns. Pin external OCI references to an immutable digest (e.g. 'namespace/repo@sha256:...') to serve them from cache; tag references (including the implicit ':latest') are re-resolved against the registry on every run, even when the sub-agent is never invoked.",
           "items": {
             "type": "string"
           }
         },
         "handoffs": {
           "type": "array",
-          "description": "List of agents this agent can hand off the conversation to. Can be names of agents defined in this config, external references (OCI images like 'namespace/repo' or URLs), or named external references using 'name:reference' syntax (e.g. 'reviewer:myorg/review-pr'). External agents without an explicit name are named after their last path segment. Pin external OCI references to an immutable digest (e.g. 'namespace/repo@sha256:...') to serve them from cache; tag references are re-resolved against the registry on every run.",
+          "description": "List of agents this agent can hand off the conversation to. Can be names of agents defined in this config, external references (OCI images like 'namespace/repo', URLs, or local config file paths like './team.yaml'), or named external references using 'name:reference' syntax (e.g. 'reviewer:myorg/review-pr'). External agents without an explicit name are named after their last path segment (file references after the file name without extension). Pin external OCI references to an immutable digest (e.g. 'namespace/repo@sha256:...') to serve them from cache; tag references are re-resolved against the registry on every run.",
           "items": {
             "type": "string"
           }
         },
         "force_handoff": {
           "type": "string",
-          "description": "Name of an agent that unconditionally receives the conversation whenever this agent produces a final response, bypassing the LLM's tool-calling entirely. Guarantees deterministic routing for strict pipelines (e.g. extractor -> summarizer). Can be the name of an agent defined in this config or an external reference. Pin an external OCI reference to an immutable digest (e.g. 'namespace/repo@sha256:...') to avoid a per-run registry lookup. Must not reference the agent itself, and force_handoff chains must not form a cycle."
+          "description": "Name of an agent that unconditionally receives the conversation whenever this agent produces a final response, bypassing the LLM's tool-calling entirely. Guarantees deterministic routing for strict pipelines (e.g. extractor -> summarizer). Can be the name of an agent defined in this config or an external reference (OCI image, URL, or local config file path). Pin an external OCI reference to an immutable digest (e.g. 'namespace/repo@sha256:...') to avoid a per-run registry lookup. Must not reference the agent itself, and force_handoff chains must not form a cycle."
         },
         "add_date": {
           "type": "boolean",

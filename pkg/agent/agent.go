@@ -21,9 +21,13 @@ import (
 // Agent represents an AI agent
 type Agent struct {
 	name                    string
+	displayName             string
 	description             string
 	welcomeMessage          string
 	instruction             string
+	teamName                string
+	teamLead                bool
+	internal                bool
 	toolsets                []*tools.StartableToolSet
 	models                  []provider.Provider
 	fallbackModels          []provider.Provider                 // Fallback models to try if primary fails
@@ -85,6 +89,28 @@ func New(name, prompt string, opts ...Opt) *Agent {
 func (a *Agent) Name() string {
 	return a.name
 }
+
+// DisplayName is the presentation label for this agent. Empty means Name.
+// Imported team leads keep their manifest-local name (usually "root") here
+// even when routing exposes them under a generated unique ID.
+func (a *Agent) DisplayName() string {
+	if a.displayName != "" {
+		return a.displayName
+	}
+	return a.name
+}
+
+// TeamName is the presentation name of the manifest/team this agent belongs
+// to. It does not affect routing or agent identity.
+func (a *Agent) TeamName() string { return a.teamName }
+
+// TeamLead reports whether this agent is the lead exposed for an imported
+// team.
+func (a *Agent) TeamLead() bool { return a.teamLead }
+
+// Internal reports whether this agent is private to an imported team. Internal
+// agents may run through scoped delegation but are not public switch targets.
+func (a *Agent) Internal() bool { return a.internal }
 
 // Instruction returns the agent's instructions
 func (a *Agent) Instruction() string {

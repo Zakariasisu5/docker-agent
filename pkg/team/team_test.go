@@ -93,11 +93,32 @@ func TestAgentOrDefault(t *testing.T) {
 	})
 }
 
+// TestAgentsInfoIncludesPrivateImportedMembers verifies the presentation roster
+// includes scoped members without adding them to the public routing registry.
+func TestAgentsInfoIncludesPrivateImportedMembers(t *testing.T) {
+	t.Parallel()
+	private := agent.New("researcher", "", agent.WithTeamInfo("specialists", false, true))
+	lead := agent.New("specialists", "", agent.WithTeamInfo("specialists", true, false), agent.WithSubAgents(private))
+	root := agent.New("root", "", agent.WithTeamInfo("primary", false, false), agent.WithSubAgents(lead))
+	tm := New(WithAgents(root, lead))
+
+	assert.Equal(t, []string{"root", "specialists"}, tm.AgentNames())
+	_, err := tm.Agent("researcher")
+	require.Error(t, err)
+
+	infos := tm.AgentsInfo(t.Context())
+	require.Len(t, infos, 3)
+	assert.Equal(t, "root", infos[0].Name)
+	assert.Equal(t, "specialists", infos[1].Name)
+	assert.True(t, infos[1].TeamLead)
+	assert.Equal(t, "researcher", infos[2].Name)
+	assert.True(t, infos[2].Internal)
+	assert.Equal(t, "specialists", infos[2].TeamName)
+}
+
 // TestAgentConfig verifies the raw per-agent config retained via
 // WithAgentConfigs is returned by name, and that callers can distinguish a
-// team built without configs (remote runtime) from one built with them: both
-// the unknown-agent and no-configs cases report false so the inspector omits
-// config-derived sections.
+// team built without configs (remote runtime) from one built with them.
 func TestAgentConfig(t *testing.T) {
 	t.Parallel()
 

@@ -75,32 +75,101 @@ func (t *Team) AgentNames() []string {
 	return names
 }
 
+// AllAgents returns the public agents plus scoped descendants, deduplicated by
+// pointer. It is for runtime lifecycle/presentation only; Agent and AgentNames
+// remain the authoritative public routing registry.
+func (t *Team) AllAgents() []*agent.Agent {
+	seen := make(map[*agent.Agent]struct{})
+	expanded := make(map[*agent.Agent]struct{})
+	all := make([]*agent.Agent, 0, len(t.agents))
+	for _, a := range t.agents {
+		if a == nil {
+			continue
+		}
+		if _, ok := seen[a]; !ok {
+			seen[a] = struct{}{}
+			all = append(all, a)
+		}
+	}
+	var walk func(*agent.Agent)
+	walk = func(a *agent.Agent) {
+		if a == nil {
+			return
+		}
+		if _, ok := expanded[a]; ok {
+			return
+		}
+		expanded[a] = struct{}{}
+		children := append([]*agent.Agent{}, a.SubAgents()...)
+		children = append(children, a.Handoffs()...)
+		if forced := a.ForceHandoff(); forced != nil {
+			children = append(children, forced)
+		}
+		for _, child := range children {
+			if child == nil {
+				continue
+			}
+			if _, ok := seen[child]; !ok {
+				seen[child] = struct{}{}
+				all = append(all, child)
+			}
+			walk(child)
+		}
+	}
+	for _, a := range t.agents {
+		walk(a)
+	}
+	return all
+}
+
 // AgentInfo contains information about an agent
 type AgentInfo struct {
+	Agent       *agent.Agent
 	Name        string
+	DisplayName string
 	Description string
 	Provider    string
 	Model       string
 	Commands    types.Commands
+	TeamName    string
+	TeamLead    bool
+	Internal    bool
 }
 
-// AgentsInfo returns information about all agents in the team
+// AgentsInfo returns the public roster plus private imported-team members for
+// presentation. Private members remain absent from AgentNames and Agent.
 func (t *Team) AgentsInfo(ctx context.Context) []AgentInfo {
-	var infos []AgentInfo
+	public := make(map[*agent.Agent]struct{}, len(t.agents))
 	for _, a := range t.agents {
+		public[a] = struct{}{}
+	}
+	seen := make(map[*agent.Agent]struct{})
+	var infos []AgentInfo
+	for _, a := range t.AllAgents() {
+		if _, ok := seen[a]; ok {
+			continue
+		}
+		seen[a] = struct{}{}
+		_, isPublic := public[a]
+		displayName := ""
+		if a.DisplayName() != a.Name() {
+			displayName = a.DisplayName()
+		}
 		info := AgentInfo{
+			Agent:       a,
 			Name:        a.Name(),
+			DisplayName: displayName,
 			Description: a.Description(),
 			Commands:    a.Commands(),
+			TeamName:    a.TeamName(),
+			TeamLead:    a.TeamLead(),
+			Internal:    a.Internal() || !isPublic,
 		}
 		if model := a.Model(ctx); model != nil {
 			id := model.ID()
 			info.Provider = id.Provider
 			info.Model = id.Model
 		} else if harnessType := a.HarnessType(); harnessType != "" {
-			// Harness-backed agents have no provider.Provider; surface the
-			// harness type (e.g. "claude-code") as the display model and leave
-			// Thinking empty so no badge/card line is shown.
 			info.Model = harnessType
 		}
 		infos = append(infos, info)
@@ -156,7 +225,7 @@ func (t *Team) Size() int {
 }
 
 func (t *Team) StopToolSets(ctx context.Context) error {
-	for _, agent := range t.agents {
+	for _, agent := range t.AllAgents() {
 		if err := agent.StopToolSets(ctx); err != nil {
 			return fmt.Errorf("failed to stop tool sets: %w", err)
 		}

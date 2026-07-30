@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -989,6 +990,279 @@ func TestGetToolsForAgent_SingleLSPToolsetNotWrapped(t *testing.T) {
 	}
 	assert.Contains(t, names, "lsp_hover")
 	assert.Contains(t, names, "lsp_definition")
+}
+
+// TestLoadLocalFileSubAgents proves a lead can import a second team's lead by
+// listing that team's YAML file in sub_agents. Only the secondary team's
+// default agent ("root" if present, otherwise the first declared) is exposed
+// to the parent — under the alias, or a name derived from the file name — and
+// it keeps its own sub-agents so it still orchestrates its own team. The file
+// reference resolves relative to the importing config, not the test's working
+// directory.
+func TestLoadLocalFileSubAgents(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "dummy")
+
+	secondary := `models:
+  model:
+    provider: openai
+    model: gpt-4o
+agents:
+  root:
+    model: model
+    description: Secondary team lead
+    instruction: Coordinate your own team to answer tasks.
+    sub_agents: [researcher]
+  researcher:
+    model: model
+    description: Researcher of the secondary team
+    instruction: Research topics and report back.
+`
+	primary := `models:
+  model:
+    provider: openai
+    model: gpt-4o
+agents:
+  root:
+    model: model
+    description: Primary lead
+    instruction: Delegate specialist work to the secondary team lead.
+    sub_agents:
+      - %s
+`
+
+	tests := []struct {
+		name        string
+		subAgentRef string
+		exposedName string
+	}{
+		{
+			name:        "aliased reference",
+			subAgentRef: "specialists:./secondary-team.yaml",
+			exposedName: "specialists",
+		},
+		{
+			name:        "unaliased reference derives the file name",
+			subAgentRef: "./secondary-team.yaml",
+			exposedName: "secondary-team",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "secondary-team.yaml"), []byte(secondary), 0o644))
+			primaryPath := filepath.Join(dir, "primary-team.yaml")
+			require.NoError(t, os.WriteFile(primaryPath, fmt.Appendf(nil, primary, tt.subAgentRef), 0o644))
+
+			team, err := Load(t.Context(), config.NewFileSource(primaryPath), &config.RuntimeConfig{}, withTestProviderRegistry()...)
+			require.NoError(t, err)
+
+			root, err := team.Agent("root")
+			require.NoError(t, err)
+
+			// The primary lead sees exactly one sub-agent: the secondary
+			// team's lead, exposed under the expected name.
+			require.Len(t, root.SubAgents(), 1)
+			lead := root.SubAgents()[0]
+			assert.Equal(t, tt.exposedName, lead.Name())
+
+			// The imported lead keeps its own sub-agents so it can still
+			// orchestrate its own team.
+			require.Len(t, lead.SubAgents(), 1)
+			assert.Equal(t, "researcher", lead.SubAgents()[0].Name())
+
+			// Only the secondary lead joins the primary team's registry; its
+			// members stay private to the imported team. At runtime the
+			// delegation handlers execute them through the lead's SubAgents
+			// pointers (the exact private/scoped instances), never through a
+			// team.Agent name lookup.
+			_, err = team.Agent(tt.exposedName)
+			require.NoError(t, err)
+			_, err = team.Agent("researcher")
+			require.Error(t, err)
+		})
+	}
+}
+
+// TestLoadLocalFileSubAgents_RejectsUnpreservedPolicies proves that importing
+// a local team file fails loudly when its manifest declares top-level
+// policies that only its default agent's graft cannot preserve: permissions,
+// the run-wide budget, named budgets (with per-agent references), and
+// runtime.safety. Silently dropping them would run the imported team with
+// weaker guarantees than its author declared.
+func TestLoadLocalFileSubAgents_RejectsUnpreservedPolicies(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "dummy")
+
+	primary := `models:
+  model:
+    provider: openai
+    model: gpt-4o
+agents:
+  root:
+    model: model
+    description: Primary lead
+    instruction: Delegate specialist work to the secondary team lead.
+    sub_agents:
+      - specialists:./secondary-team.yaml
+`
+	secondaryBase := `models:
+  model:
+    provider: openai
+    model: gpt-4o
+agents:
+  root:
+    model: model
+    description: Secondary team lead
+    instruction: Coordinate your own team to answer tasks.
+`
+
+	tests := []struct {
+		name      string
+		secondary string
+		wantIn    string
+	}{
+		{
+			name: "permissions",
+			secondary: secondaryBase + `permissions:
+  deny: ["shell"]
+`,
+			wantIn: "permissions",
+		},
+		{
+			name: "run-wide budget",
+			secondary: secondaryBase + `budget:
+  max_cost: 5
+`,
+			wantIn: "budget",
+		},
+		{
+			name: "named budgets with agent references",
+			secondary: `models:
+  model:
+    provider: openai
+    model: gpt-4o
+agents:
+  root:
+    model: model
+    description: Secondary team lead
+    instruction: Coordinate your own team to answer tasks.
+    budgets: [tight]
+budgets:
+  tight:
+    max_cost: 1
+`,
+			wantIn: "budgets",
+		},
+		{
+			name: "runtime safety",
+			secondary: secondaryBase + `runtime:
+  safety: strict
+`,
+			wantIn: "runtime.safety",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "secondary-team.yaml"), []byte(tt.secondary), 0o644))
+			primaryPath := filepath.Join(dir, "primary-team.yaml")
+			require.NoError(t, os.WriteFile(primaryPath, []byte(primary), 0o644))
+
+			_, err := Load(t.Context(), config.NewFileSource(primaryPath), &config.RuntimeConfig{}, withTestProviderRegistry()...)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantIn)
+			assert.Contains(t, err.Error(), "cannot be preserved",
+				"the error must explain why the import is rejected")
+			assert.Contains(t, err.Error(), "importing (main) manifest",
+				"the error must tell the user where to declare the policy instead")
+		})
+	}
+}
+
+// TestLoadLocalFileSubAgents_AgentLevelSafetyAllowed: agent-level safety
+// (agents.<name>.safety) lives on the agent object itself, so it survives
+// the import and must not trip the top-level policy rejection.
+func TestLoadLocalFileSubAgents_AgentLevelSafetyAllowed(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "dummy")
+
+	secondary := `models:
+  model:
+    provider: openai
+    model: gpt-4o
+agents:
+  root:
+    model: model
+    description: Secondary team lead
+    instruction: Coordinate your own team to answer tasks.
+    safety: strict
+`
+	primary := `models:
+  model:
+    provider: openai
+    model: gpt-4o
+agents:
+  root:
+    model: model
+    description: Primary lead
+    instruction: Delegate specialist work to the secondary team lead.
+    sub_agents:
+      - specialists:./secondary-team.yaml
+`
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "secondary-team.yaml"), []byte(secondary), 0o644))
+	primaryPath := filepath.Join(dir, "primary-team.yaml")
+	require.NoError(t, os.WriteFile(primaryPath, []byte(primary), 0o644))
+
+	team, err := Load(t.Context(), config.NewFileSource(primaryPath), &config.RuntimeConfig{}, withTestProviderRegistry()...)
+	require.NoError(t, err)
+
+	lead, err := team.Agent("specialists")
+	require.NoError(t, err)
+	assert.Equal(t, latest.SafetyModeStrict, lead.Safety(),
+		"agent-level safety must survive the import on the agent object")
+}
+
+// TestLoadLocalFileSubAgents_CircularReferenceFails: two local files that
+// import each other must fail with a clear circular-reference error at the
+// first repeated path, not after ten nested initialisations.
+func TestLoadLocalFileSubAgents_CircularReferenceFails(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "dummy")
+
+	teamA := `models:
+  model:
+    provider: openai
+    model: gpt-4o
+agents:
+  root:
+    model: model
+    description: Team A lead
+    instruction: Lead team A.
+    sub_agents:
+      - b:./team-b.yaml
+`
+	teamB := `models:
+  model:
+    provider: openai
+    model: gpt-4o
+agents:
+  root:
+    model: model
+    description: Team B lead
+    instruction: Lead team B.
+    sub_agents:
+      - a:./team-a.yaml
+`
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "team-a.yaml"), []byte(teamA), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "team-b.yaml"), []byte(teamB), 0o644))
+
+	_, err := Load(t.Context(), config.NewFileSource(filepath.Join(dir, "team-a.yaml")), &config.RuntimeConfig{}, withTestProviderRegistry()...)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "circular local team reference")
+	assert.Contains(t, err.Error(), filepath.Join(dir, "team-b.yaml"))
 }
 
 func TestExternalDepthContext(t *testing.T) {

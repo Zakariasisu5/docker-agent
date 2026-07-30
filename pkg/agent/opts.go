@@ -53,6 +53,22 @@ func WithName(name string) Opt {
 	}
 }
 
+func WithDisplayName(name string) Opt {
+	return func(a *Agent) {
+		a.displayName = name
+	}
+}
+
+// WithTeamInfo attaches presentation-only team metadata. It never changes
+// routing visibility; the parent team registry remains authoritative for that.
+func WithTeamInfo(name string, lead, internal bool) Opt {
+	return func(a *Agent) {
+		a.teamName = name
+		a.teamLead = lead
+		a.internal = internal
+	}
+}
+
 func WithModel(model provider.Provider) Opt {
 	return func(a *Agent) {
 		a.models = append(a.models, model)

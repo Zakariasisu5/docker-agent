@@ -694,6 +694,66 @@ func TestIsExternalReference(t *testing.T) {
 			input:    "myagent:https://example.com/agent.yaml",
 			expected: true,
 		},
+		{
+			name:     "relative local yaml path is external",
+			input:    "./secondary-team.yaml",
+			expected: true,
+		},
+		{
+			name:     "bare local yaml path is external",
+			input:    "secondary-team.yaml",
+			expected: true,
+		},
+		{
+			name:     "relative local yml path is external",
+			input:    "./team.yml",
+			expected: true,
+		},
+		{
+			name:     "bare local hcl path is external",
+			input:    "team.hcl",
+			expected: true,
+		},
+		{
+			name:     "absolute local yaml path is external",
+			input:    "/agents/secondary-team.yaml",
+			expected: true,
+		},
+		{
+			name:     "windows drive local yaml path is external",
+			input:    `C:\agents\secondary-team.yaml`,
+			expected: true,
+		},
+		{
+			name:     "named local yaml path is external",
+			input:    "specialists:./secondary-team.yaml",
+			expected: true,
+		},
+		{
+			name:     "named windows drive hcl path is external",
+			input:    `specialists:C:\agents\team.hcl`,
+			expected: true,
+		},
+		{
+			name:     "single-letter named local yaml path is external",
+			input:    "b:./team-b.yaml",
+			expected: true,
+		},
+		{
+			name:     "named absolute hcl path is external",
+			input:    "specialists:/agents/team.hcl",
+			expected: true,
+		},
+		{
+			name:     "name resembling a config file is not external",
+			input:    "secondary-team-yaml",
+			expected: false,
+		},
+		{
+			name:     "file name with unknown extension is not external",
+			input:    "notes.txt",
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -774,6 +834,48 @@ func TestParseExternalAgentRef(t *testing.T) {
 			input:        "registry.example.com/org/sub/agent:latest",
 			expectedName: "agent",
 			expectedRef:  "registry.example.com/org/sub/agent:latest",
+		},
+		{
+			name:         "relative local yaml path derives file name",
+			input:        "./secondary-team.yaml",
+			expectedName: "secondary-team",
+			expectedRef:  "./secondary-team.yaml",
+		},
+		{
+			name:         "named local yaml path",
+			input:        "specialists:./secondary-team.yaml",
+			expectedName: "specialists",
+			expectedRef:  "./secondary-team.yaml",
+		},
+		{
+			name:         "named windows drive hcl path",
+			input:        `specialists:C:\agents\team.hcl`,
+			expectedName: "specialists",
+			expectedRef:  `C:\agents\team.hcl`,
+		},
+		{
+			name:         "single-letter name is an alias, not a windows drive",
+			input:        "b:./team-b.yaml",
+			expectedName: "b",
+			expectedRef:  "./team-b.yaml",
+		},
+		{
+			name:         "absolute local yaml path derives file name",
+			input:        "/agents/secondary-team.yaml",
+			expectedName: "secondary-team",
+			expectedRef:  "/agents/secondary-team.yaml",
+		},
+		{
+			name:         "named parent-relative yml path",
+			input:        "helpers:../shared/helpers.yml",
+			expectedName: "helpers",
+			expectedRef:  "../shared/helpers.yml",
+		},
+		{
+			name:         "bare local hcl path derives file name",
+			input:        "team.hcl",
+			expectedName: "team",
+			expectedRef:  "team.hcl",
 		},
 	}
 
