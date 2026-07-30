@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	coreagent "github.com/docker/docker-agent/pkg/agent"
 	"github.com/docker/docker-agent/pkg/concurrent"
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/telemetry/genai"
@@ -66,8 +66,16 @@ type RunParams struct {
 	AgentName      string
 	Task           string
 	ExpectedOutput string
-	ParentSession  *session.Session
-	OnContent      func(content string)
+	// Caller is the exact agent that dispatched the task, captured by
+	// HandleRun before the task goroutine starts.
+	Caller *coreagent.Agent
+	// Target is the exact validated sub-agent instance to run, taken from
+	// Caller's sub-agents list at dispatch time. The runtime must use it
+	// verbatim instead of re-resolving AgentName, which could fail or
+	// substitute another agent after a concurrent handoff.
+	Target        *coreagent.Agent
+	ParentSession *session.Session
+	OnContent     func(content string)
 }
 
 // RunResult holds the outcome of a sub-agent execution.
@@ -78,8 +86,12 @@ type RunResult struct {
 
 // Runner abstracts the runtime dependency for background agent execution.
 type Runner interface {
-	// CurrentAgentSubAgentNames returns the names of the current agent's sub-agents.
-	CurrentAgentSubAgentNames() []string
+	// SessionAgent returns the exact agent driving sess: the session pin
+	// when set, the runtime's current agent otherwise. HandleRun snapshots
+	// it — and the validated target from its sub-agents — before spawning
+	// the task goroutine so a concurrent handoff cannot swap either
+	// identity.
+	SessionAgent(sess *session.Session) *coreagent.Agent
 	// RunAgent starts a sub-agent and blocks until completion or cancellation.
 	RunAgent(ctx context.Context, params RunParams) *RunResult
 }
@@ -276,8 +288,24 @@ func (h *Handler) HandleRun(ctx context.Context, sess *session.Session, toolCall
 		return tools.ResultError("task must not be empty"), nil
 	}
 
-	subAgentNames := h.runner.CurrentAgentSubAgentNames()
-	if !slices.Contains(subAgentNames, params.Agent) {
+	// Snapshot the caller and its sub-agents once: the allow-list check and
+	// the target capture must see the same state, and both must happen
+	// before the goroutine below so a concurrent handoff cannot swap the
+	// caller or substitute the target mid-dispatch.
+	caller := h.runner.SessionAgent(sess)
+	if caller == nil {
+		return tools.ResultError("no current agent available to dispatch background tasks"), nil
+	}
+	subAgents := caller.SubAgents()
+	var target *coreagent.Agent
+	subAgentNames := make([]string, len(subAgents))
+	for i, a := range subAgents {
+		subAgentNames[i] = a.Name()
+		if a.Name() == params.Agent {
+			target = a
+		}
+	}
+	if target == nil {
 		if len(subAgentNames) > 0 {
 			return tools.ResultError(fmt.Sprintf("agent %q is not in the sub-agents list. Available: %s", params.Agent, strings.Join(subAgentNames, ", "))), nil
 		}
@@ -372,6 +400,8 @@ func (h *Handler) HandleRun(ctx context.Context, sess *session.Session, toolCall
 			AgentName:      params.Agent,
 			Task:           params.Task,
 			ExpectedOutput: params.ExpectedOutput,
+			Caller:         caller,
+			Target:         target,
 			ParentSession:  sess,
 			OnContent:      t.writeOutput,
 		})

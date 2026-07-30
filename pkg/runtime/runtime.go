@@ -817,10 +817,6 @@ func (r *LocalRuntime) currentAgentName() string {
 	return r.agents.Name()
 }
 
-func (r *LocalRuntime) setCurrentAgent(name string) {
-	r.agents.Set(name)
-}
-
 func (r *LocalRuntime) CurrentAgentInfo(context.Context) CurrentAgentInfo {
 	currentAgent := r.CurrentAgent()
 
@@ -1402,8 +1398,11 @@ func (r *LocalRuntime) agentDetailsFromTeam(ctx context.Context) []AgentDetails 
 		modelName := info.Model
 		var thinking string
 
-		// Get the agent to access fallbacks and the effective thinking level.
-		if a, err := r.team.Agent(info.Name); err == nil && a != nil {
+		// Public agents can be looked up in the team registry. Private imported
+		// members already carry their resolved provider/model in AgentInfo; their
+		// thinking label is populated when they become active via AgentInfo events.
+		if info.Agent != nil {
+			a := info.Agent
 			// Check if this agent has an active fallback cooldown
 			cooldownState := r.fallback.cooldowns.Get(info.Name)
 			if cooldownState != nil {
@@ -1419,11 +1418,15 @@ func (r *LocalRuntime) agentDetailsFromTeam(ctx context.Context) []AgentDetails 
 
 		details[i] = AgentDetails{
 			Name:        info.Name,
+			DisplayName: info.DisplayName,
 			Description: info.Description,
 			Provider:    providerName,
 			Model:       modelName,
 			Thinking:    thinking,
 			Commands:    info.Commands,
+			TeamName:    info.TeamName,
+			TeamLead:    info.TeamLead,
+			Internal:    info.Internal,
 		}
 	}
 	return details

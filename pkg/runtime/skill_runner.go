@@ -101,13 +101,16 @@ func (r *LocalRuntime) RunSkillFork(ctx context.Context, sess *session.Session, 
 	}
 
 	// Skills are sub-sessions of the caller, not delegations, so the
-	// runtime's currentAgent stays put.
+	// runtime's currentAgent stays put. Carry the exact caller instance so
+	// the child session resolves it even when the caller is private to the
+	// team registry (e.g. a member of an imported team).
 	return r.runForwarding(ctx, sess, evts, delegationRequest{
 		SubSessionConfig: SubSessionConfig{
 			Task:                prepared.Task,
 			SystemMessage:       skills.BuildSkillSystemMessage(prepared, sess.AttachedFilesSnapshot()),
 			ImplicitUserMessage: skills.BuildSkillUserMessage(prepared),
 			AgentName:           ca,
+			Agent:               r.CurrentAgent(),
 			Title:               "Skill: " + prepared.SkillName,
 			ToolsApproved:       sess.IsToolsApproved(),
 			SafetyPolicy:        sess.GetSafetyPolicy(),

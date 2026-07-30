@@ -364,6 +364,13 @@ type Session struct {
 	// concurrently on different agents.
 	AgentName string `json:"-"`
 
+	// PinnedAgent, when non-nil, pins this session to an exact agent instance
+	// and takes precedence over AgentName. Required for sessions running agents
+	// that are not in the runtime's public team registry (e.g. members of a
+	// team imported from a local config file, which stay private to their own
+	// lead). Never persisted.
+	PinnedAgent *agent.Agent `json:"-"`
+
 	// ParentID indicates this is a sub-session created by task transfer.
 	// Sub-sessions are not persisted as standalone entries; they are embedded
 	// within the parent session's Messages array.
@@ -1368,6 +1375,15 @@ func WithPermissions(perms *PermissionsConfig) Opt {
 func WithAgentName(name string) Opt {
 	return func(s *Session) {
 		s.AgentName = name
+	}
+}
+
+// WithPinnedAgent pins this session to an exact agent instance. Unlike
+// WithAgentName it does not rely on the runtime's team registry, so it can
+// target agents that are private to an imported team.
+func WithPinnedAgent(a *agent.Agent) Opt {
+	return func(s *Session) {
+		s.PinnedAgent = a
 	}
 }
 

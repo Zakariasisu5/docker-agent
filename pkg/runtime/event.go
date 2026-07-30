@@ -939,9 +939,13 @@ func AgentInfo(agentName, model, description, welcomeMessage string, contextLimi
 // AgentDetails contains information about an agent for display in the sidebar
 type AgentDetails struct {
 	Name        string `json:"name"`
+	DisplayName string `json:"display_name,omitempty"`
 	Description string `json:"description"`
 	Provider    string `json:"provider"`
 	Model       string `json:"model"`
+	TeamName    string `json:"team_name,omitempty"`
+	TeamLead    bool   `json:"team_lead,omitempty"`
+	Internal    bool   `json:"internal,omitempty"`
 	// Thinking is a short label describing the model's current thinking-effort
 	// configuration: an effort level (e.g. "high"), "adaptive", a decimal token
 	// count for token-based budgets, or "off" when disabled. Empty when the

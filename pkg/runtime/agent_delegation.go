@@ -29,6 +29,20 @@ func agentNames(agents []*agent.Agent) []string {
 	return names
 }
 
+// agentByName returns the agent with the given name from the list, or nil
+// when absent. Delegation handlers use it to pick the exact validated
+// instance out of the caller's sub-agent/handoff list rather than doing a
+// team-registry lookup, so targets that are private to an imported team
+// (e.g. members behind a local-file team lead) resolve correctly.
+func agentByName(agents []*agent.Agent, name string) *agent.Agent {
+	for _, a := range agents {
+		if a.Name() == name {
+			return a
+		}
+	}
+	return nil
+}
+
 // validateAgentInList checks that targetAgent appears in the given agent list.
 // Returns a tool error result if not found, or nil if the target is valid.
 // The action describes the attempted operation (e.g. "transfer task to"),
@@ -88,6 +102,13 @@ type SubSessionConfig struct {
 	SystemMessage string
 	// AgentName is the name of the agent that will execute the sub-session.
 	AgentName string
+	// Agent, when non-nil, is the exact agent instance that will execute the
+	// sub-session, taking precedence over resolving AgentName against the
+	// team registry. Delegation handlers set it from the caller's validated
+	// sub-agent list so targets that are private to an imported team (not in
+	// the public registry) can still run. AgentName must stay set for labels,
+	// events and hooks.
+	Agent *agent.Agent
 	// Title is a human-readable label for the sub-session (e.g. "Transferred task").
 	Title string
 	// ToolsApproved overrides whether tools are pre-approved in the child session.
@@ -105,9 +126,11 @@ type SubSessionConfig struct {
 	// (e.g. MCP server, A2A adapter, background agent). This causes the runtime
 	// to auto-stop on max iterations instead of blocking for user input.
 	NonInteractive bool
-	// PinAgent, when true, pins the child session to AgentName via
-	// session.WithAgentName. This is required for concurrent background
-	// tasks that must not share the runtime's mutable currentAgent field.
+	// PinAgent, when true, pins the child session to the resolved agent via
+	// session.WithAgentName and session.WithPinnedAgent. This is required for
+	// concurrent background tasks that must not share the runtime's mutable
+	// currentAgent field; the instance pin also lets RunStream resolve agents
+	// that are private to the team registry.
 	PinAgent bool
 	// ImplicitUserMessage, when non-empty, overrides the default "Please proceed."
 	// user message sent to the child session. This allows callers like skill
@@ -145,13 +168,23 @@ type SubSessionConfig struct {
 type delegationRequest struct {
 	SubSessionConfig
 
+	// Caller, when non-nil, is the exact agent that initiated the
+	// delegation, resolved pin-aware from the calling session. Handlers set
+	// it so a delegation issued inside a pinned background session is
+	// attributed to the pinned agent, not to whatever the shared router
+	// happens to point at. When nil, runForwarding falls back to the
+	// router's current agent.
+	Caller *agent.Agent
+
 	// SwitchCurrentAgent, when true, swaps r.currentAgent to AgentName
 	// for the lifetime of the call and emits AgentSwitching/AgentInfo
 	// events on entry and exit. Used by transfer_task. Mutually
 	// exclusive in spirit with PinAgent: pinning is for concurrent
 	// sub-sessions that must NOT share the runtime's mutable
 	// currentAgent, while switching is for sequential delegations where
-	// the parent loop is blocked anyway.
+	// the parent loop is blocked anyway. When the parent session is
+	// itself pinned, runForwarding downgrades the switch to a pin so the
+	// shared router is never touched from a background session.
 	SwitchCurrentAgent bool
 }
 
@@ -192,7 +225,7 @@ func newSubSession(parent *session.Session, cfg SubSessionConfig, childAgent *ag
 		session.WithAttachedFiles(attachedFiles),
 	}
 	if cfg.PinAgent {
-		opts = append(opts, session.WithAgentName(cfg.AgentName))
+		opts = append(opts, session.WithAgentName(cfg.AgentName), session.WithPinnedAgent(childAgent))
 	}
 	opts = append(opts, session.WithPermissions(cfg.Permissions))
 	// Merge parent's excluded tools with config's excluded tools so that
@@ -240,15 +273,19 @@ func mergeExcludedTools(parent, child []string) []string {
 // `from`, emits the counterpart events and the matching return-side hooks)
 // when invoked.
 //
+// The router carries the exact agent instances, not just their names, so a
+// delegation target that is private to the team registry (e.g. a member of
+// an imported local-file team) stays resolvable while it is current.
+//
 // Use as `defer r.swapCurrentAgent(ctx, sessionID, from, to, evts)()` so the
 // swap takes effect immediately and the restore runs at function exit.
 func (r *LocalRuntime) swapCurrentAgent(ctx context.Context, sessionID string, from, to *agent.Agent, evts EventSink) func() {
 	evts.Emit(AgentSwitching(true, from.Name(), to.Name()))
 	r.executeOnAgentSwitchHooks(ctx, from, sessionID, from.Name(), to.Name(), agentSwitchKindTransferTask)
-	r.setCurrentAgent(to.Name())
+	r.agents.SetAgent(to)
 	evts.Emit(AgentInfo(to.Name(), agentModelLabel(ctx, to), to.Description(), to.WelcomeMessage()))
 	return func() {
-		r.setCurrentAgent(from.Name())
+		r.agents.SetAgent(from)
 		evts.Emit(AgentSwitching(false, to.Name(), from.Name()))
 		r.executeOnAgentSwitchHooks(ctx, from, sessionID, to.Name(), from.Name(), agentSwitchKindTransferTaskReturn)
 		evts.Emit(AgentInfo(from.Name(), agentModelLabel(ctx, from), from.Description(), from.WelcomeMessage()))
@@ -276,17 +313,38 @@ func (r *LocalRuntime) swapCurrentAgent(ctx context.Context, sessionID string, f
 func (r *LocalRuntime) runForwarding(ctx context.Context, parent *session.Session, evts EventSink, req delegationRequest) (*tools.ToolCallResult, error) {
 	span := trace.SpanFromContext(ctx)
 
-	callerAgent, err := r.team.Agent(r.currentAgentName())
-	if err != nil {
-		return nil, fmt.Errorf("current agent not found: %w", err)
+	// Prefer the caller the handler resolved from its session; the router
+	// is only a fallback for requests that don't carry one. Either way the
+	// caller is an exact instance, so a nested delegation from an agent
+	// that is private to the team registry still resolves; a name lookup
+	// against the team would not.
+	callerAgent := req.Caller
+	if callerAgent == nil {
+		callerAgent = r.CurrentAgent()
 	}
-	child, err := r.team.Agent(req.AgentName)
-	if err != nil {
-		return nil, err
+	if callerAgent == nil {
+		return nil, fmt.Errorf("current agent not found: %s", r.currentAgentName())
+	}
+	child := req.Agent
+	if child == nil {
+		var err error
+		child, err = r.team.Agent(req.AgentName)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if req.SwitchCurrentAgent {
-		defer r.swapCurrentAgent(ctx, parent.ID, callerAgent, child, evts)()
+		if parent.PinnedAgent != nil || parent.AgentName != "" {
+			// The parent session is pinned (e.g. a background agent task):
+			// the shared router belongs to concurrent foreground sessions
+			// and must never be swapped from here. Pin the exact child
+			// instead so its RunStream resolves it; the transfer stays
+			// blocking either way.
+			req.PinAgent = true
+		} else {
+			defer r.swapCurrentAgent(ctx, parent.ID, callerAgent, child, evts)()
+		}
 	}
 
 	s := newSubSession(parent, req.SubSessionConfig, child)
@@ -340,26 +398,34 @@ func (r *LocalRuntime) runForwarding(ctx context.Context, parent *session.Sessio
 // events are dropped and only the final assistant message (or the first
 // error) matters.
 //
+// caller is the agent that dispatched the task, captured by the caller at
+// dispatch time; it owns the subagent_stop hook executor. It may be nil
+// (dispatchHook then no-ops).
+//
 // Unlike runForwarding it does not emit AgentSwitching/AgentInfo events:
 // callers like background agents PinAgent the child session so the
 // runtime never mutates the shared currentAgent state.
-func (r *LocalRuntime) runCollecting(ctx context.Context, parent *session.Session, cfg SubSessionConfig, onContent func(string)) *agenttool.RunResult {
-	child, err := r.team.Agent(cfg.AgentName)
-	if err != nil {
-		return &agenttool.RunResult{ErrMsg: fmt.Sprintf("agent %q not found: %s", cfg.AgentName, err)}
+func (r *LocalRuntime) runCollecting(ctx context.Context, parent *session.Session, cfg SubSessionConfig, caller *agent.Agent, onContent func(string)) *agenttool.RunResult {
+	child := cfg.Agent
+	if child == nil {
+		var err error
+		child, err = r.team.Agent(cfg.AgentName)
+		if err != nil {
+			return &agenttool.RunResult{ErrMsg: fmt.Sprintf("agent %q not found: %s", cfg.AgentName, err)}
+		}
 	}
 
 	s := newSubSession(parent, cfg, child)
 
 	// subagent_stop fires after the background sub-session has fully
-	// drained — success or failure. The parent agent at the time of
-	// dispatch (whoever called run_background_agent) owns the executor;
-	// we resolve it via CurrentAgent because the background path doesn't
-	// carry the parent agent name. dispatchHook silently no-ops when
-	// CurrentAgent is nil. The deferred call ensures the hook fires even
-	// when an ErrorEvent or ctx cancellation breaks us out of the loop.
+	// drained — success or failure. The caller captured at dispatch time
+	// (whoever called run_background_agent) owns the executor; resolving
+	// the current agent here instead would misattribute the hook after a
+	// concurrent handoff. dispatchHook silently no-ops when caller is nil.
+	// The deferred call ensures the hook fires even when an ErrorEvent or
+	// ctx cancellation breaks us out of the loop.
 	defer func() {
-		r.executeSubagentStopHooks(ctx, parent, s, r.CurrentAgent(), cfg.AgentName, s.GetLastAssistantMessageContent())
+		r.executeSubagentStopHooks(ctx, parent, s, caller, cfg.AgentName, s.GetLastAssistantMessageContent())
 	}()
 
 	var errMsg string
@@ -517,13 +583,10 @@ func (r *LocalRuntime) persistBackgroundSubSession(ctx context.Context, parentID
 	}
 }
 
-// CurrentAgentSubAgentNames implements agenttool.Runner.
-func (r *LocalRuntime) CurrentAgentSubAgentNames() []string {
-	a := r.CurrentAgent()
-	if a == nil {
-		return nil
-	}
-	return agentNames(a.SubAgents())
+// SessionAgent implements agenttool.Runner: the exact agent driving sess,
+// honouring the session pin before the shared router.
+func (r *LocalRuntime) SessionAgent(sess *session.Session) *agent.Agent {
+	return r.resolveSessionAgent(sess)
 }
 
 // RunAgent implements agenttool.Runner. It starts a sub-agent synchronously
@@ -534,17 +597,32 @@ func (r *LocalRuntime) CurrentAgentSubAgentNames() []string {
 // Tool calls that result in an "Ask" outcome will be auto-denied by the dispatcher
 // due to the non-interactive context.
 func (r *LocalRuntime) RunAgent(ctx context.Context, params agenttool.RunParams) *agenttool.RunResult {
+	// HandleRun captures the exact caller and validated target at dispatch
+	// time; use them verbatim so a concurrent handoff that repoints the
+	// router can neither fail this run nor substitute another agent.
+	// Callers that only carry a name (direct invocations in tests) keep the
+	// legacy resolution: the router's current agent and its sub-agents
+	// first, then the team registry as fallback in runCollecting.
+	caller := params.Caller
+	if caller == nil {
+		caller = r.CurrentAgent()
+	}
+	target := params.Target
+	if target == nil && caller != nil {
+		target = agentByName(caller.SubAgents(), params.AgentName)
+	}
 	return r.runCollecting(ctx, params.ParentSession, SubSessionConfig{
 		Task:           params.Task,
 		ExpectedOutput: params.ExpectedOutput,
 		AgentName:      params.AgentName,
+		Agent:          target,
 		Title:          "Background agent task",
 		ToolsApproved:  params.ParentSession.IsToolsApproved(),
 		SafetyPolicy:   params.ParentSession.GetSafetyPolicy(),
 		Permissions:    params.ParentSession.ClonePermissions(),
 		NonInteractive: true,
 		PinAgent:       true,
-	}, params.OnContent)
+	}, caller, params.OnContent)
 }
 
 func (r *LocalRuntime) handleTaskTransfer(ctx context.Context, sess *session.Session, toolCall tools.ToolCall, evts EventSink) (*tools.ToolCallResult, error) {
@@ -557,10 +635,20 @@ func (r *LocalRuntime) handleTaskTransfer(ctx context.Context, sess *session.Ses
 		return nil, fmt.Errorf("invalid arguments: %w", err)
 	}
 
-	a := r.CurrentAgent()
+	// Pin-aware caller resolution: a transfer issued inside a pinned
+	// background session must be attributed to the pinned agent, not to the
+	// shared router, which a concurrent foreground delegation may repoint
+	// at any time.
+	a := r.resolveSessionAgent(sess)
+	if a == nil {
+		return nil, fmt.Errorf("current agent not found: %s", r.currentAgentName())
+	}
 	if errResult := validateAgentInList(a.Name(), params.Agent, "transfer task to", "sub-agents list", a.SubAgents()); errResult != nil {
 		return errResult, nil
 	}
+	// The exact instance from the validated list, not a team lookup: members
+	// of an imported team are only reachable through their lead's SubAgents.
+	target := agentByName(a.SubAgents(), params.Agent)
 
 	slog.DebugContext(ctx, "Transferring task to agent", "from_agent", a.Name(), "to_agent", params.Agent, "task", params.Task)
 
@@ -599,12 +687,14 @@ func (r *LocalRuntime) handleTaskTransfer(ctx context.Context, sess *session.Ses
 			Task:           params.Task,
 			ExpectedOutput: params.ExpectedOutput,
 			AgentName:      params.Agent,
+			Agent:          target,
 			Title:          "Transferred task",
 			ToolsApproved:  sess.IsToolsApproved(),
 			SafetyPolicy:   sess.GetSafetyPolicy(),
 			Permissions:    sess.ClonePermissions(),
 			NonInteractive: sess.NonInteractive,
 		},
+		Caller:             a,
 		SwitchCurrentAgent: true,
 	})
 }
@@ -615,20 +705,22 @@ func (r *LocalRuntime) handleHandoff(ctx context.Context, sess *session.Session,
 		return nil, fmt.Errorf("invalid arguments: %w", err)
 	}
 
-	ca := r.currentAgentName()
-	currentAgent, err := r.team.Agent(ca)
-	if err != nil {
-		return nil, fmt.Errorf("current agent not found: %w", err)
+	// Resolve the caller pin-aware from the session (falling back to the
+	// router, which carries the exact instance) and the target from the
+	// caller's validated handoffs list, so handoffs keep working when
+	// either side is private to the team registry and when they run inside
+	// a pinned background session.
+	currentAgent := r.resolveSessionAgent(sess)
+	if currentAgent == nil {
+		return nil, fmt.Errorf("current agent not found: %s", r.currentAgentName())
 	}
+	ca := currentAgent.Name()
 
 	if errResult := validateAgentInList(ca, params.Agent, "hand off to", "handoffs list", currentAgent.Handoffs()); errResult != nil {
 		return errResult, nil
 	}
 
-	next, err := r.team.Agent(params.Agent)
-	if err != nil {
-		return nil, err
-	}
+	next := agentByName(currentAgent.Handoffs(), params.Agent)
 
 	// Handoff is in-place agent swap (same session, different agent
 	// from the next turn). Span name keeps the runtime.* family;
@@ -651,7 +743,17 @@ func (r *LocalRuntime) handleHandoff(ctx context.Context, sess *session.Session,
 	defer span.End()
 
 	r.executeOnAgentSwitchHooks(ctx, currentAgent, sess.ID, ca, next.Name(), agentSwitchKindHandoff)
-	r.setCurrentAgent(next.Name())
+	if sess.PinnedAgent != nil || sess.AgentName != "" {
+		// A pinned session owns its agent identity through the pin, and the
+		// shared router belongs to concurrent foreground sessions. Repoint
+		// the pin so the next turn runs the handoff target without touching
+		// the router. Safe without synchronisation: the run loop re-reads
+		// the pin only after this tool batch has joined.
+		sess.PinnedAgent = next
+		sess.AgentName = next.Name()
+	} else {
+		r.agents.SetAgent(next)
+	}
 	handoffMessage := "The agent " + ca + " handed off the conversation to you. " +
 		"Your available handoff agents and tools are specified in the system messages that follow. " +
 		"Only use those capabilities - do not attempt to use tools or hand off to agents that you see " +
@@ -675,7 +777,7 @@ func (r *LocalRuntime) applyForceHandoff(ctx context.Context, sess *session.Sess
 	slog.InfoContext(ctx, "Forced handoff", "from_agent", from.Name(), "to_agent", to.Name(), "session_id", sess.ID)
 
 	r.executeOnAgentSwitchHooks(ctx, from, sess.ID, from.Name(), to.Name(), agentSwitchKindForceHandoff)
-	r.setCurrentAgent(to.Name())
+	r.agents.SetAgent(to)
 
 	sess.AddMessage(session.ImplicitUserMessage(
 		"The agent " + from.Name() + " finished its response and the conversation was automatically " +

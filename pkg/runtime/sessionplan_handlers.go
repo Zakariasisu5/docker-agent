@@ -49,7 +49,7 @@ func (r *LocalRuntime) handleReadSessionPlan(_ context.Context, sess *session.Se
 
 // handleExitPlanMode marks the session's plan as ready and returns control to
 // the host. Switching agents is the host's decision — the runtime does not
-// call setCurrentAgent here so a CLI that prints results inline, a chat UI
+// call SetCurrentAgent here so a CLI that prints results inline, a chat UI
 // with a mode toggle, and a server with a configured handoff can all consume
 // the same marker without one stepping on the other.
 func (r *LocalRuntime) handleExitPlanMode(_ context.Context, sess *session.Session, _ tools.ToolCall, _ EventSink) (*tools.ToolCallResult, error) {

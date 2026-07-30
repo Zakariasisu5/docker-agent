@@ -107,6 +107,7 @@ func (s *Session) Clone() *Session {
 		AllowedTools:            cloneStringSlice(s.AllowedTools),
 		ExtraToolSets:           slices.Clone(s.ExtraToolSets),
 		AgentName:               s.AgentName,
+		PinnedAgent:             s.PinnedAgent,
 		ParentID:                s.ParentID,
 		InstructionContext:      cloneInstructionContext(s.InstructionContext),
 		MessageUsageHistory:     slices.Clone(s.MessageUsageHistory),

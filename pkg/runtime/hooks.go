@@ -29,25 +29,36 @@ import (
 // lock.
 func (r *LocalRuntime) buildHooksExecutors() {
 	r.hooksExecByAgent = make(map[string]*hooks.Executor)
-	for _, name := range r.team.AgentNames() {
-		a, err := r.team.Agent(name)
-		if err != nil {
+	for _, a := range r.team.AllAgents() {
+		if _, exists := r.hooksExecByAgent[a.Name()]; exists {
+			// Private members from different imported teams may share a local ID.
+			// Their hooks are built lazily by exact pointer in hooksExec instead
+			// of overwriting another agent's name-keyed executor here.
 			continue
 		}
-		cfg := builtins.ApplyAgentDefaults(a.Hooks(), builtins.AgentDefaults{
-			AddDate:            a.AddDate(),
-			AddEnvironmentInfo: a.AddEnvironmentInfo(),
-			AddPromptFiles:     a.AddPromptFiles(),
-			RedactSecrets:      a.RedactSecrets(),
-		})
-		cfg = applyAutoInjectors(cfg, r.autoInjectors)
-		cfg = applyCacheDefault(cfg, a)
-		if cfg == nil {
-			continue
+		if exec := r.newHooksExecutor(a); exec != nil {
+			r.hooksExecByAgent[a.Name()] = exec
 		}
-		builtins.WarnIfSaferShellConfigured(cfg)
-		r.hooksExecByAgent[name] = hooks.NewExecutorWithRegistry(cfg, r.workingDir, r.env, r.hooksRegistry)
 	}
+}
+
+func (r *LocalRuntime) newHooksExecutor(a *agent.Agent) *hooks.Executor {
+	if a == nil {
+		return nil
+	}
+	cfg := builtins.ApplyAgentDefaults(a.Hooks(), builtins.AgentDefaults{
+		AddDate:            a.AddDate(),
+		AddEnvironmentInfo: a.AddEnvironmentInfo(),
+		AddPromptFiles:     a.AddPromptFiles(),
+		RedactSecrets:      a.RedactSecrets(),
+	})
+	cfg = applyAutoInjectors(cfg, r.autoInjectors)
+	cfg = applyCacheDefault(cfg, a)
+	if cfg == nil {
+		return nil
+	}
+	builtins.WarnIfSaferShellConfigured(cfg)
+	return hooks.NewExecutorWithRegistry(cfg, r.workingDir, r.env, r.hooksRegistry)
 }
 
 // applyAutoInjectors runs each AutoInjector against cfg, allocating a
@@ -78,7 +89,24 @@ func (r *LocalRuntime) hooksExec(a *agent.Agent) *hooks.Executor {
 	if a == nil {
 		return nil
 	}
-	return r.hooksExecByAgent[a.Name()]
+	if exec := r.hooksExecByAgent[a.Name()]; exec != nil {
+		// A public/name-unique agent uses the prebuilt executor. When another
+		// pointer shares this local ID, only reuse it if it is the public team
+		// instance; private collisions need their own exact executor.
+		if registered, err := r.team.Agent(a.Name()); err == nil && registered == a {
+			return exec
+		}
+		matches := 0
+		for _, candidate := range r.team.AllAgents() {
+			if candidate.Name() == a.Name() {
+				matches++
+			}
+		}
+		if matches == 1 {
+			return exec
+		}
+	}
+	return r.newHooksExecutor(a)
 }
 
 // dispatchHook is the common dispatch path shared by every hook

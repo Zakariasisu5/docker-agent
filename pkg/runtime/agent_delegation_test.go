@@ -4,13 +4,19 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/docker/docker-agent/pkg/agent"
+	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/model/provider"
+	"github.com/docker/docker-agent/pkg/model/provider/base"
+	"github.com/docker/docker-agent/pkg/modelsdev"
 	"github.com/docker/docker-agent/pkg/permissions"
 	"github.com/docker/docker-agent/pkg/runtime/toolexec"
 	"github.com/docker/docker-agent/pkg/safety"
@@ -18,6 +24,7 @@ import (
 	"github.com/docker/docker-agent/pkg/team"
 	"github.com/docker/docker-agent/pkg/tools"
 	agenttool "github.com/docker/docker-agent/pkg/tools/builtin/agent"
+	"github.com/docker/docker-agent/pkg/tools/builtin/transfertask"
 )
 
 func TestBuildTaskSystemMessage(t *testing.T) {
@@ -642,4 +649,473 @@ func TestTransferTask_PropagatesPermissions(t *testing.T) {
 	parentClone := sess.ClonePermissions()
 	assert.Equal(t, []string{"safe_tool"}, parentClone.Allow,
 		"parent permissions must remain isolated from child mutations after transfer_task")
+}
+
+// privateTeamFixture models a team imported from a local config file: the
+// secondary lead ("specialists") joins the primary team's public registry,
+// but its own member ("researcher") stays private — reachable only through
+// the lead's SubAgents pointers, never via team.Agent.
+type privateTeamFixture struct {
+	rt         *LocalRuntime
+	tm         *team.Team
+	root       *agent.Agent
+	lead       *agent.Agent
+	researcher *agent.Agent
+}
+
+// newPrivateTeamFixture builds root -> specialists -> researcher where only
+// root and specialists are registered in team.Team. Providers are supplied
+// per agent so each test scripts its own streams.
+func newPrivateTeamFixture(t *testing.T, rootProv, leadProv, researcherProv provider.Provider) privateTeamFixture {
+	t.Helper()
+
+	researcher := agent.New("researcher", "Researcher of the secondary team", agent.WithModel(researcherProv))
+	lead := agent.New("specialists", "Secondary team lead",
+		agent.WithModel(leadProv),
+		agent.WithToolSets(transfertask.New()),
+	)
+	agent.WithSubAgents(researcher)(lead)
+	root := agent.New("root", "Primary lead",
+		agent.WithModel(rootProv),
+		agent.WithToolSets(transfertask.New()),
+	)
+	agent.WithSubAgents(lead)(root)
+
+	tm := team.New(team.WithAgents(root, lead))
+	rt, err := NewLocalRuntime(t.Context(), tm,
+		WithSessionCompaction(false),
+		WithModelStore(mockModelStore{}),
+	)
+	require.NoError(t, err)
+
+	// The researcher must really be private for these tests to prove anything.
+	_, err = tm.Agent("researcher")
+	require.Error(t, err, "fixture invariant: researcher must not be in the public team registry")
+
+	return privateTeamFixture{rt: rt, tm: tm, root: root, lead: lead, researcher: researcher}
+}
+
+// TestHandleTaskTransfer_NestedPrivateSubAgent proves the imported-team flow:
+// while the secondary lead is the current agent, transfer_task("researcher")
+// must resolve the researcher through the lead's SubAgents pointers even
+// though the researcher is not in team.Team, run it to completion, and
+// restore the lead as the current agent afterwards.
+func TestHandleTaskTransfer_NestedPrivateSubAgent(t *testing.T) {
+	t.Parallel()
+
+	researcherStream := newStreamBuilder().AddContent("research notes").AddStopWithUsage(10, 5).Build()
+	fx := newPrivateTeamFixture(t,
+		&mockProvider{id: "test/mock-model", stream: &mockStream{}},
+		&mockProvider{id: "test/mock-model", stream: &mockStream{}},
+		&mockProvider{id: "test/mock-model", stream: researcherStream},
+	)
+
+	// Simulate the state mid-delegation: root already transferred to the lead.
+	require.NoError(t, fx.rt.SetCurrentAgent(t.Context(), "specialists"))
+
+	sess := session.New(session.WithUserMessage("Test"), session.WithToolsApproved(true))
+	evts := make(chan Event, 256)
+	toolCall := tools.ToolCall{
+		ID:   "call_1",
+		Type: "function",
+		Function: tools.FunctionCall{
+			Name:      "transfer_task",
+			Arguments: `{"agent":"researcher","task":"research the topic","expected_output":"notes"}`,
+		},
+	}
+
+	result, err := fx.rt.handleTaskTransfer(t.Context(), sess, toolCall, NewChannelSink(evts))
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.IsError, "nested transfer to a private sub-agent must succeed")
+	assert.Equal(t, "research notes", result.Output)
+
+	assert.Equal(t, "specialists", fx.rt.CurrentAgentName(t.Context()),
+		"the secondary lead must be restored as current agent after the nested transfer")
+
+	// The researcher stays private even after being run.
+	_, err = fx.tm.Agent("researcher")
+	require.Error(t, err)
+}
+
+// TestHandleTaskTransfer_NestedPrivateBlocksUntilRelease proves the nested
+// transfer is synchronous: handleTaskTransfer must not return before the
+// private child's model stream completes. The child provider blocks on a
+// channel; timeouts are used only as guards.
+func TestHandleTaskTransfer_NestedPrivateBlocksUntilRelease(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	fx := newPrivateTeamFixture(t,
+		&mockProvider{id: "test/mock-model", stream: &mockStream{}},
+		&mockProvider{id: "test/mock-model", stream: &mockStream{}},
+		&activeRootBlockingProvider{id: "test/mock-model", release: release},
+	)
+
+	require.NoError(t, fx.rt.SetCurrentAgent(t.Context(), "specialists"))
+
+	sess := session.New(session.WithUserMessage("Test"), session.WithToolsApproved(true))
+	evts := make(chan Event, 512)
+	toolCall := tools.ToolCall{
+		ID:   "call_1",
+		Type: "function",
+		Function: tools.FunctionCall{
+			Name:      "transfer_task",
+			Arguments: `{"agent":"researcher","task":"research the topic","expected_output":"notes"}`,
+		},
+	}
+
+	type outcome struct {
+		result *tools.ToolCallResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := fx.rt.handleTaskTransfer(t.Context(), sess, toolCall, NewChannelSink(evts))
+		done <- outcome{result: result, err: err}
+	}()
+
+	// Wait until the swap to the private child is observable, so the
+	// not-yet-returned assertion below checks a transfer that is provably
+	// in flight rather than one that has not started.
+	guard := time.After(10 * time.Second)
+	for fx.rt.CurrentAgentName(t.Context()) != "researcher" {
+		select {
+		case out := <-done:
+			t.Fatalf("transfer returned before the child was released (result=%+v, err=%v)", out.result, out.err)
+		case <-guard:
+			t.Fatal("timed out waiting for the transfer to switch to the researcher")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	select {
+	case out := <-done:
+		t.Fatalf("transfer returned before the child was released (result=%+v, err=%v)", out.result, out.err)
+	default:
+	}
+
+	close(release)
+
+	select {
+	case out := <-done:
+		require.NoError(t, out.err)
+		require.NotNil(t, out.result)
+		assert.False(t, out.result.IsError)
+	case <-time.After(10 * time.Second):
+		t.Fatal("transfer did not return after the child was released")
+	}
+
+	assert.Equal(t, "specialists", fx.rt.CurrentAgentName(t.Context()),
+		"the secondary lead must be restored as current agent after the nested transfer")
+}
+
+// TestRunStream_NestedPrivateDelegation drives the full documented chain
+// through the run loop: primary root -> transfer_task("specialists")
+// (blocking) -> secondary lead -> transfer_task("researcher") (blocking) ->
+// back to the lead -> back to root. The researcher exists only as a SubAgents
+// pointer of the lead, never in team.Team.
+func TestRunStream_NestedPrivateDelegation(t *testing.T) {
+	t.Parallel()
+
+	// Each agent's provider serves one stream per model turn: the tool-call
+	// turn, then the final answer after the tool result comes back.
+	rootProv := &queueProvider{id: "test/mock-model", streams: []chat.MessageStream{
+		newStreamBuilder().
+			AddToolCallName("call_root", "transfer_task").
+			AddToolCallArguments("call_root", `{"agent":"specialists","task":"coordinate the research"}`).
+			AddStopWithUsage(10, 5).
+			Build(),
+		newStreamBuilder().AddContent("root done").AddStopWithUsage(10, 5).Build(),
+	}}
+	leadProv := &queueProvider{id: "test/mock-model", streams: []chat.MessageStream{
+		newStreamBuilder().
+			AddToolCallName("call_lead", "transfer_task").
+			AddToolCallArguments("call_lead", `{"agent":"researcher","task":"research the topic"}`).
+			AddStopWithUsage(10, 5).
+			Build(),
+		newStreamBuilder().AddContent("lead done").AddStopWithUsage(10, 5).Build(),
+	}}
+	researcherStream := newStreamBuilder().
+		AddContent("research notes").
+		AddStopWithUsage(10, 5).
+		Build()
+
+	fx := newPrivateTeamFixture(t,
+		rootProv,
+		leadProv,
+		&mockProvider{id: "test/mock-model", stream: researcherStream},
+	)
+
+	sess := session.New(session.WithUserMessage("Delegate the research."), session.WithToolsApproved(true))
+
+	var errEvents []string
+	for event := range fx.rt.RunStream(t.Context(), sess) {
+		if errEvent, ok := event.(*ErrorEvent); ok {
+			errEvents = append(errEvents, errEvent.Error)
+		}
+	}
+	require.Empty(t, errEvents, "the nested delegation chain must complete without errors")
+
+	assert.Equal(t, "root done", sess.GetLastAssistantMessageContent())
+
+	// The lead's sub-session is attached to the root session, and the
+	// researcher's sub-session is attached to the lead's, mirroring the
+	// delegation chain.
+	leadSession := findSubSession(sess)
+	require.NotNil(t, leadSession, "root session must record the lead's sub-session")
+	assert.Equal(t, "lead done", leadSession.GetLastAssistantMessageContent())
+
+	researcherSession := findSubSession(leadSession)
+	require.NotNil(t, researcherSession, "lead session must record the researcher's sub-session")
+	assert.Equal(t, "research notes", researcherSession.GetLastAssistantMessageContent())
+
+	assert.Equal(t, "root", fx.rt.CurrentAgentName(t.Context()),
+		"the primary root must be the current agent again after the chain returns")
+}
+
+// findSubSession returns the first sub-session recorded on sess, or nil.
+func findSubSession(sess *session.Session) *session.Session {
+	for _, item := range sess.Messages {
+		if item.SubSession != nil {
+			return item.SubSession
+		}
+	}
+	return nil
+}
+
+// TestRunAgent_PrivateSubAgentOfCurrentAgent covers run_background_agent from
+// a secondary lead: the Runner API only carries a name, so RunAgent must
+// resolve "researcher" from the current agent's SubAgents pointers (the team
+// registry does not know it) and pin the child session to that exact
+// instance.
+func TestRunAgent_PrivateSubAgentOfCurrentAgent(t *testing.T) {
+	t.Parallel()
+
+	researcherStream := newStreamBuilder().AddContent("research notes").AddStopWithUsage(10, 5).Build()
+	fx := newPrivateTeamFixture(t,
+		&mockProvider{id: "test/mock-model", stream: &mockStream{}},
+		&mockProvider{id: "test/mock-model", stream: &mockStream{}},
+		&mockProvider{id: "test/mock-model", stream: researcherStream},
+	)
+
+	require.NoError(t, fx.rt.SetCurrentAgent(t.Context(), "specialists"))
+
+	parentSession := session.New(session.WithUserMessage("Test"), session.WithToolsApproved(true))
+	result := fx.rt.RunAgent(t.Context(), agenttool.RunParams{
+		AgentName:     "researcher",
+		Task:          "research the topic",
+		ParentSession: parentSession,
+	})
+	require.Empty(t, result.ErrMsg, "background run of a private sub-agent must succeed")
+	assert.Equal(t, "research notes", result.Result)
+
+	childSession := findSubSession(parentSession)
+	require.NotNil(t, childSession, "parent must record the background sub-session")
+	assert.Equal(t, "researcher", childSession.AgentName)
+	assert.Same(t, fx.researcher, childSession.PinnedAgent,
+		"the child session must pin the exact private instance so RunStream resolves it")
+}
+
+// signallingBlockingProvider closes started when its first model call
+// begins, then blocks until release before serving a stream with the given
+// content. It lets tests assert runtime state while a child agent's model
+// call is provably in flight.
+type signallingBlockingProvider struct {
+	id      string
+	content string
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (p *signallingBlockingProvider) ID() modelsdev.ID { return modelsdev.ParseIDOrZero(p.id) }
+
+func (p *signallingBlockingProvider) CreateChatCompletionStream(ctx context.Context, _ []chat.Message, _ []tools.Tool) (chat.MessageStream, error) {
+	p.once.Do(func() { close(p.started) })
+	select {
+	case <-p.release:
+		return newStreamBuilder().AddContent(p.content).AddStopWithUsage(1, 1).Build(), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (p *signallingBlockingProvider) BaseConfig() base.Config { return base.Config{} }
+func (p *signallingBlockingProvider) MaxTokens() int          { return 0 }
+
+// TestHandleTaskTransfer_PinnedBackgroundSessionKeepsRouterUntouched is the
+// regression test for pin-aware delegation: a background session pinned to
+// the secondary lead calls transfer_task("researcher") while the global
+// router points at root for the whole run. Root has no "researcher"
+// sub-agent, so resolving the caller from the router would reject the
+// transfer outright; resolving it from the pin must succeed, block until the
+// exact private child completes, and never touch the shared router.
+func TestHandleTaskTransfer_PinnedBackgroundSessionKeepsRouterUntouched(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fx := newPrivateTeamFixture(t,
+		&mockProvider{id: "test/mock-model", stream: &mockStream{}},
+		&mockProvider{id: "test/mock-model", stream: &mockStream{}},
+		&signallingBlockingProvider{id: "test/mock-model", content: "research notes", started: started, release: release},
+	)
+
+	// Only the session pin carries the lead identity, exactly as
+	// runCollecting builds background sessions; the router stays on root.
+	require.Equal(t, "root", fx.rt.CurrentAgentName(t.Context()))
+	sess := session.New(
+		session.WithUserMessage("Test"),
+		session.WithToolsApproved(true),
+		session.WithAgentName("specialists"),
+		session.WithPinnedAgent(fx.lead),
+	)
+
+	evts := make(chan Event, 512)
+	toolCall := tools.ToolCall{
+		ID:   "call_1",
+		Type: "function",
+		Function: tools.FunctionCall{
+			Name:      "transfer_task",
+			Arguments: `{"agent":"researcher","task":"research the topic","expected_output":"notes"}`,
+		},
+	}
+
+	type outcome struct {
+		result *tools.ToolCallResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := fx.rt.handleTaskTransfer(t.Context(), sess, toolCall, NewChannelSink(evts))
+		done <- outcome{result: result, err: err}
+	}()
+
+	// Wait until the researcher's model call is provably in flight.
+	select {
+	case <-started:
+	case out := <-done:
+		t.Fatalf("transfer returned before the child started (result=%+v, err=%v)", out.result, out.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the researcher's model call to start")
+	}
+
+	assert.Equal(t, "root", fx.rt.CurrentAgentName(t.Context()),
+		"a pinned session's transfer_task must not swap the global router while in flight")
+
+	// The nested transfer stays blocking: no return before the child is released.
+	select {
+	case out := <-done:
+		t.Fatalf("transfer returned before the child was released (result=%+v, err=%v)", out.result, out.err)
+	default:
+	}
+
+	close(release)
+
+	var out outcome
+	select {
+	case out = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("transfer did not return after the child was released")
+	}
+	require.NoError(t, out.err)
+	require.NotNil(t, out.result)
+	assert.False(t, out.result.IsError, "pin-resolved transfer to a private sub-agent must succeed")
+	assert.Equal(t, "research notes", out.result.Output)
+
+	assert.Equal(t, "root", fx.rt.CurrentAgentName(t.Context()),
+		"the global router must be untouched after the pinned session's transfer")
+
+	// The child ran as the exact private instance, pinned for its RunStream.
+	childSession := findSubSession(sess)
+	require.NotNil(t, childSession, "the pinned parent must record the child sub-session")
+	assert.Equal(t, "researcher", childSession.AgentName)
+	assert.Same(t, fx.researcher, childSession.PinnedAgent,
+		"the child session must pin the exact private instance")
+}
+
+// TestRunAgent_UsesCapturedCallerAndTarget verifies the runtime half of the
+// HandleRun snapshot contract: RunAgent runs the exact Caller/Target captured
+// at dispatch time even though the shared router points at an agent (root)
+// that cannot resolve the target name, instead of re-deriving them from the
+// router when the background goroutine finally runs.
+func TestRunAgent_UsesCapturedCallerAndTarget(t *testing.T) {
+	t.Parallel()
+
+	researcherStream := newStreamBuilder().AddContent("research notes").AddStopWithUsage(10, 5).Build()
+	fx := newPrivateTeamFixture(t,
+		&mockProvider{id: "test/mock-model", stream: &mockStream{}},
+		&mockProvider{id: "test/mock-model", stream: &mockStream{}},
+		&mockProvider{id: "test/mock-model", stream: researcherStream},
+	)
+
+	// Root's sub-agents do not include the researcher: any late
+	// re-derivation from the router would fail or substitute here.
+	require.Equal(t, "root", fx.rt.CurrentAgentName(t.Context()))
+
+	parentSession := session.New(session.WithUserMessage("Test"), session.WithToolsApproved(true))
+	result := fx.rt.RunAgent(t.Context(), agenttool.RunParams{
+		AgentName:     "researcher",
+		Task:          "research the topic",
+		Caller:        fx.lead,
+		Target:        fx.researcher,
+		ParentSession: parentSession,
+	})
+	require.Empty(t, result.ErrMsg, "RunAgent must use the captured target, not re-resolve via the router")
+	assert.Equal(t, "research notes", result.Result)
+
+	childSession := findSubSession(parentSession)
+	require.NotNil(t, childSession, "parent must record the background sub-session")
+	assert.Same(t, fx.researcher, childSession.PinnedAgent,
+		"the captured target instance must be pinned on the child session")
+	assert.Equal(t, "root", fx.rt.CurrentAgentName(t.Context()),
+		"a captured-target background run must leave the router untouched")
+}
+
+// TestHandleHandoff_PinnedSessionRepointsPinNotRouter locks the pinned-session
+// handoff semantics: the caller is resolved from the pin, the pin itself is
+// repointed at the exact handoff target so the session's next turn runs it,
+// and the shared router never moves.
+func TestHandleHandoff_PinnedSessionRepointsPinNotRouter(t *testing.T) {
+	t.Parallel()
+
+	prov := &mockProvider{id: "test/mock-model", stream: &mockStream{}}
+	researcher := agent.New("researcher", "Handoff target", agent.WithModel(prov))
+	lead := agent.New("specialists", "Secondary team lead", agent.WithModel(prov))
+	agent.WithHandoffs(researcher)(lead)
+	root := agent.New("root", "Primary lead", agent.WithModel(prov))
+
+	tm := team.New(team.WithAgents(root, lead))
+	rt, err := NewLocalRuntime(t.Context(), tm,
+		WithSessionCompaction(false),
+		WithModelStore(mockModelStore{}),
+	)
+	require.NoError(t, err)
+	require.Equal(t, "root", rt.CurrentAgentName(t.Context()))
+
+	sess := session.New(
+		session.WithUserMessage("Test"),
+		session.WithAgentName("specialists"),
+		session.WithPinnedAgent(lead),
+	)
+	toolCall := tools.ToolCall{
+		ID:   "call_1",
+		Type: "function",
+		Function: tools.FunctionCall{
+			Name:      "handoff",
+			Arguments: `{"agent":"researcher"}`,
+		},
+	}
+
+	evts := make(chan Event, 16)
+	result, err := rt.handleHandoff(t.Context(), sess, toolCall, NewChannelSink(evts))
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.IsError, "handoff from the pinned lead to its handoff target must succeed")
+
+	assert.Same(t, researcher, sess.PinnedAgent, "the session pin must be repointed at the exact target")
+	assert.Equal(t, "researcher", sess.AgentName)
+	assert.Equal(t, "root", rt.CurrentAgentName(t.Context()),
+		"a pinned session's handoff must not swap the global router")
 }

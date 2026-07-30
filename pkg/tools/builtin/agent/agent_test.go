@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	coreagent "github.com/docker/docker-agent/pkg/agent"
 	"github.com/docker/docker-agent/pkg/concurrent"
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/tools"
@@ -20,13 +21,19 @@ import (
 
 // mockRunner implements Runner for testing.
 type mockRunner struct {
-	subAgentNames []string
-	runResult     *RunResult
-	runDelay      time.Duration // optional delay to simulate work
+	caller    *coreagent.Agent
+	runResult *RunResult
+	runDelay  time.Duration // optional delay to simulate work
+
+	mu         sync.Mutex
+	lastParams *RunParams // params of the most recent RunAgent call
 }
 
-func (m *mockRunner) CurrentAgentSubAgentNames() []string { return m.subAgentNames }
+func (m *mockRunner) SessionAgent(*session.Session) *coreagent.Agent { return m.caller }
 func (m *mockRunner) RunAgent(ctx context.Context, params RunParams) *RunResult {
+	m.mu.Lock()
+	m.lastParams = &params
+	m.mu.Unlock()
 	if m.runDelay > 0 {
 		select {
 		case <-time.After(m.runDelay):
@@ -42,6 +49,22 @@ func (m *mockRunner) RunAgent(ctx context.Context, params RunParams) *RunResult 
 		return m.runResult
 	}
 	return &RunResult{}
+}
+
+func (m *mockRunner) gotParams() *RunParams {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastParams
+}
+
+// callerWithSubAgents builds a caller agent whose sub-agents are stub agents
+// with the given names.
+func callerWithSubAgents(names ...string) *coreagent.Agent {
+	subs := make([]*coreagent.Agent, len(names))
+	for i, n := range names {
+		subs[i] = coreagent.New(n, "")
+	}
+	return coreagent.New("root", "", coreagent.WithSubAgents(subs...))
 }
 
 func newTestHandler() *Handler {
@@ -421,7 +444,7 @@ func TestStopAll_WaitsForGoroutines(t *testing.T) {
 
 func TestHandleRun_EmptyAgent(t *testing.T) {
 	t.Parallel()
-	h := newTestHandlerWithRunner(&mockRunner{subAgentNames: []string{"sub"}})
+	h := newTestHandlerWithRunner(&mockRunner{caller: callerWithSubAgents("sub")})
 	tc := makeToolCall(t, RunBackgroundAgentArgs{Agent: "", Task: "do something"})
 	result, err := h.HandleRun(t.Context(), session.New(), tc)
 	require.NoError(t, err)
@@ -431,7 +454,7 @@ func TestHandleRun_EmptyAgent(t *testing.T) {
 
 func TestHandleRun_EmptyTask(t *testing.T) {
 	t.Parallel()
-	h := newTestHandlerWithRunner(&mockRunner{subAgentNames: []string{"sub"}})
+	h := newTestHandlerWithRunner(&mockRunner{caller: callerWithSubAgents("sub")})
 	tc := makeToolCall(t, RunBackgroundAgentArgs{Agent: "sub", Task: ""})
 	result, err := h.HandleRun(t.Context(), session.New(), tc)
 	require.NoError(t, err)
@@ -441,7 +464,7 @@ func TestHandleRun_EmptyTask(t *testing.T) {
 
 func TestHandleRun_InvalidSubAgent(t *testing.T) {
 	t.Parallel()
-	h := newTestHandlerWithRunner(&mockRunner{subAgentNames: []string{"sub"}})
+	h := newTestHandlerWithRunner(&mockRunner{caller: callerWithSubAgents("sub")})
 	tc := makeToolCall(t, RunBackgroundAgentArgs{Agent: "nonexistent", Task: "do something"})
 	result, err := h.HandleRun(t.Context(), session.New(), tc)
 	require.NoError(t, err)
@@ -451,7 +474,7 @@ func TestHandleRun_InvalidSubAgent(t *testing.T) {
 
 func TestHandleRun_NoSubAgents(t *testing.T) {
 	t.Parallel()
-	h := newTestHandlerWithRunner(&mockRunner{subAgentNames: nil})
+	h := newTestHandlerWithRunner(&mockRunner{caller: callerWithSubAgents()})
 	tc := makeToolCall(t, RunBackgroundAgentArgs{Agent: "some-agent", Task: "do something"})
 	result, err := h.HandleRun(t.Context(), session.New(), tc)
 	require.NoError(t, err)
@@ -459,9 +482,19 @@ func TestHandleRun_NoSubAgents(t *testing.T) {
 	assert.Contains(t, result.Output, "no sub-agents configured")
 }
 
+func TestHandleRun_NoCurrentAgent(t *testing.T) {
+	t.Parallel()
+	h := newTestHandlerWithRunner(&mockRunner{})
+	tc := makeToolCall(t, RunBackgroundAgentArgs{Agent: "sub", Task: "do something"})
+	result, err := h.HandleRun(t.Context(), session.New(), tc)
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+	assert.Contains(t, result.Output, "no current agent")
+}
+
 func TestHandleRun_ConcurrencyCapEnforced(t *testing.T) {
 	t.Parallel()
-	h := newTestHandlerWithRunner(&mockRunner{subAgentNames: []string{"sub"}})
+	h := newTestHandlerWithRunner(&mockRunner{caller: callerWithSubAgents("sub")})
 
 	for i := range maxConcurrentTasks {
 		insertTask(h, "fake"+string(rune('a'+i)), "sub", taskRunning)
@@ -476,7 +509,7 @@ func TestHandleRun_ConcurrencyCapEnforced(t *testing.T) {
 
 func TestHandleRun_InvalidJSON(t *testing.T) {
 	t.Parallel()
-	h := newTestHandlerWithRunner(&mockRunner{subAgentNames: []string{"sub"}})
+	h := newTestHandlerWithRunner(&mockRunner{caller: callerWithSubAgents("sub")})
 	bad := tools.ToolCall{Function: tools.FunctionCall{Arguments: "not-json"}}
 	_, err := h.HandleRun(t.Context(), session.New(), bad)
 	require.Error(t, err, "invalid JSON should return an error")
@@ -485,8 +518,8 @@ func TestHandleRun_InvalidJSON(t *testing.T) {
 func TestHandleRun_StartsTask(t *testing.T) {
 	t.Parallel()
 	h := newTestHandlerWithRunner(&mockRunner{
-		subAgentNames: []string{"sub"},
-		runResult:     &RunResult{Result: "done"},
+		caller:    callerWithSubAgents("sub"),
+		runResult: &RunResult{Result: "done"},
 	})
 
 	tc := makeToolCall(t, RunBackgroundAgentArgs{Agent: "sub", Task: "write a poem"})
@@ -505,11 +538,37 @@ func TestHandleRun_StartsTask(t *testing.T) {
 	})
 }
 
+// TestHandleRun_CapturesCallerAndTargetAtDispatch locks the snapshot
+// contract: HandleRun resolves the caller and the validated target exactly
+// once, synchronously, and hands those instances to RunAgent — the task
+// goroutine never re-resolves them, so a concurrent handoff cannot fail the
+// run or substitute another agent.
+func TestHandleRun_CapturesCallerAndTargetAtDispatch(t *testing.T) {
+	t.Parallel()
+	caller := callerWithSubAgents("sub", "other")
+	target := caller.SubAgents()[0]
+	runner := &mockRunner{caller: caller, runResult: &RunResult{Result: "done"}}
+	h := newTestHandlerWithRunner(runner)
+
+	tc := makeToolCall(t, RunBackgroundAgentArgs{Agent: "sub", Task: "work"})
+	result, err := h.HandleRun(t.Context(), session.New(), tc)
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+
+	h.wg.Wait()
+
+	got := runner.gotParams()
+	require.NotNil(t, got, "RunAgent must have been invoked")
+	assert.Same(t, caller, got.Caller, "HandleRun must pass the exact caller captured at dispatch")
+	assert.Same(t, target, got.Target, "HandleRun must pass the exact validated target captured at dispatch")
+	assert.Equal(t, "sub", got.AgentName)
+}
+
 func TestHandleRun_ProviderError_TaskFails(t *testing.T) {
 	t.Parallel()
 	h := newTestHandlerWithRunner(&mockRunner{
-		subAgentNames: []string{"sub"},
-		runResult:     &RunResult{ErrMsg: "model unavailable"},
+		caller:    callerWithSubAgents("sub"),
+		runResult: &RunResult{ErrMsg: "model unavailable"},
 	})
 
 	tc := makeToolCall(t, RunBackgroundAgentArgs{Agent: "sub", Task: "do something"})
@@ -529,8 +588,8 @@ func TestHandleRun_ProviderError_TaskFails(t *testing.T) {
 func TestHandleRun_WithExpectedOutput(t *testing.T) {
 	t.Parallel()
 	h := newTestHandlerWithRunner(&mockRunner{
-		subAgentNames: []string{"sub"},
-		runResult:     &RunResult{Result: "result"},
+		caller:    callerWithSubAgents("sub"),
+		runResult: &RunResult{Result: "result"},
 	})
 
 	tc := makeToolCall(t, RunBackgroundAgentArgs{
@@ -553,8 +612,8 @@ func TestHandleRun_WithExpectedOutput(t *testing.T) {
 func TestHandleRun_TotalCapAutoPruneAdmits(t *testing.T) {
 	t.Parallel()
 	h := newTestHandlerWithRunner(&mockRunner{
-		subAgentNames: []string{"sub"},
-		runResult:     &RunResult{Result: "done"},
+		caller:    callerWithSubAgents("sub"),
+		runResult: &RunResult{Result: "done"},
 	})
 
 	for i := range maxTotalTasks {
@@ -572,7 +631,7 @@ func TestHandleRun_TotalCapAutoPruneAdmits(t *testing.T) {
 
 func TestHandleRun_TotalCapExhaustion_ConcurrencyCapFiresFirst(t *testing.T) {
 	t.Parallel()
-	h := newTestHandlerWithRunner(&mockRunner{subAgentNames: []string{"sub"}})
+	h := newTestHandlerWithRunner(&mockRunner{caller: callerWithSubAgents("sub")})
 
 	for i := range maxConcurrentTasks {
 		insertTask(h, fmt.Sprintf("run%d", i), "sub", taskRunning)
