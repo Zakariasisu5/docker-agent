@@ -174,9 +174,11 @@ func (s *SessionState) AvailableAgents() []runtime.AgentDetails {
 func (s *SessionState) SetAvailableAgents(availableAgents []runtime.AgentDetails) {
 	s.availableAgents = availableAgents
 
-	names := make([]string, len(availableAgents))
-	for i, a := range availableAgents {
-		names[i] = a.Name
+	var names []string
+	for _, a := range availableAgents {
+		if !a.Internal {
+			names = append(names, a.Name)
+		}
 	}
 	styles.SetAgentOrder(names)
 }

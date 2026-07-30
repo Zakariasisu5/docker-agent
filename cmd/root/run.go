@@ -72,6 +72,7 @@ type runExecFlags struct {
 	remoteAddress     string
 	modelOverrides    []string
 	promptFiles       []string
+	teams             []string
 	dryRun            bool
 	runConfig         config.RuntimeConfig
 	sessionDB         string
@@ -143,6 +144,7 @@ func newRunCmd() *cobra.Command {
 		Long:  "Run an agent with the specified configuration and prompt",
 		Example: `  docker-agent run ./agent.yaml
   docker-agent run ./team.yaml --agent root
+  docker-agent run ./primary.yaml --team "Research team=./secondary.yaml"
   docker-agent run # project config or built-in default agent
   docker-agent run coder # built-in coding agent
   docker-agent run ./echo.yaml "INSTRUCTIONS"
@@ -168,6 +170,7 @@ func addRunOrExecFlags(cmd *cobra.Command, flags *runExecFlags) {
 	cmd.PersistentFlags().BoolVar(&flags.hideToolResults, "hide-tool-results", false, "Hide tool call results")
 	cmd.PersistentFlags().StringVar(&flags.attachmentPath, "attach", "", "Attach an image file to the message")
 	cmd.PersistentFlags().StringArrayVar(&flags.promptFiles, "prompt-file", nil, "Append file contents to the prompt (repeatable)")
+	cmd.PersistentFlags().StringArrayVar(&flags.teams, "team", nil, "Attach a local YAML/HCL team to the primary lead: 'Team name=path' (repeatable)")
 	cmd.PersistentFlags().StringArrayVar(&flags.modelOverrides, "model", nil, "Override agent model: [agent=]provider/model (repeatable)")
 	cmd.PersistentFlags().BoolVar(&flags.dryRun, "dry-run", false, "Initialize the agent without executing anything")
 	cmd.PersistentFlags().StringVar(&flags.remoteAddress, "remote", "", "Use remote runtime with specified address")
@@ -210,6 +213,8 @@ func addRunOrExecFlags(cmd *cobra.Command, flags *runExecFlags) {
 	cmd.PersistentFlags().BoolVar(&flags.sessionReadOnly, "session-read-only", false, "Open the session in read-only mode (view conversation history but prevent new messages)")
 	cmd.MarkFlagsMutuallyExclusive("fake", "record")
 	cmd.MarkFlagsMutuallyExclusive("remote", "sandbox")
+	cmd.MarkFlagsMutuallyExclusive("remote", "team")
+	cmd.MarkFlagsMutuallyExclusive("sandbox", "team")
 	cmd.MarkFlagsMutuallyExclusive("remote", "session-db")
 	cmd.MarkFlagsMutuallyExclusive("remote", "session")
 	cmd.MarkFlagsMutuallyExclusive("remote", "record")
@@ -851,6 +856,9 @@ func (f *runExecFlags) loadAgentFrom(ctx context.Context, req runtime.LoadTeamRe
 	opts := append(loaderdefaults.Opts(), teamloader.WithModelOverrides(req.ModelOverrides))
 	if len(req.PromptFiles) > 0 {
 		opts = append(opts, teamloader.WithPromptFiles(req.PromptFiles))
+	}
+	if len(req.ExternalTeams) > 0 {
+		opts = append(opts, teamloader.WithExternalTeams(req.ExternalTeams))
 	}
 	return teamloader.LoadWithConfig(ctx, req.Source, req.RunConfig, opts...)
 }

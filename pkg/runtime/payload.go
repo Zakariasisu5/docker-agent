@@ -23,6 +23,7 @@ type LoadTeamRequest struct {
 	Source         config.Source         `json:"-"`
 	ModelOverrides []string              `json:"model_overrides,omitempty"`
 	PromptFiles    []string              `json:"prompt_files,omitempty"`
+	ExternalTeams  []string              `json:"external_teams,omitempty"`
 	RunConfig      *config.RuntimeConfig `json:"-"`
 }
 

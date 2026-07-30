@@ -1551,10 +1551,14 @@ func (m *model) agentSummaryCollapsed() string {
 		summary.WriteString(styles.MutedStyle.Render(" " + m.agentModel))
 	}
 	for _, entry := range m.rosterAgents() {
-		if entry.agent.Name == name {
+		if entry.agent.Internal || entry.agent.Name == name {
 			continue
 		}
-		summary.WriteString(styles.MutedStyle.Render(" · ") + styles.AgentAccentStyleFor(entry.agent.Name).Render(entry.agent.Name))
+		display := agentDisplayName(entry.agent)
+		if entry.agent.TeamName != "" {
+			display = entry.agent.TeamName + ": " + display
+		}
+		summary.WriteString(styles.MutedStyle.Render(" · ") + styles.AgentAccentStyleFor(entry.agent.Name).Render(display))
 	}
 	return summary.String()
 }
@@ -2084,19 +2088,20 @@ func (m *model) queueSection(contentWidth int) string {
 // separators and the transfer box carry an empty owner so they stay
 // unclickable.
 func (m *model) agentInfo(contentWidth int) string {
-	// Read current agent from session state so sidebar updates when agent is switched
 	currentAgent := m.sessionState.CurrentAgentName()
 	if currentAgent == "" {
 		return ""
 	}
 	roster := m.rosterAgents()
-
-	agentTitle := "Agent"
-	if len(roster) > 1 {
-		agentTitle = "Agents"
+	teamNames := make(map[string]struct{})
+	for _, agent := range m.availableAgents {
+		if agent.TeamName != "" {
+			teamNames[agent.TeamName] = struct{}{}
+		}
 	}
-	if m.delegationInFlight() {
-		agentTitle += " ↔"
+	grouped := len(teamNames) > 1
+	if !grouped {
+		return m.renderLegacyAgentTab(roster, contentWidth, currentAgent)
 	}
 
 	renderAgent := m.compactAgentRenderer(roster, contentWidth)
@@ -2104,34 +2109,105 @@ func (m *model) agentInfo(contentWidth int) string {
 		renderAgent = m.detailedAgentRenderer(roster, contentWidth)
 	}
 
-	var bodyLines, owners []string
-	add := func(line, owner string) {
-		bodyLines = append(bodyLines, line)
-		owners = append(owners, owner)
+	type group struct {
+		name    string
+		entries []rosterAgent
 	}
+	var groups []group
+	indexByName := make(map[string]int)
 	for _, entry := range roster {
-		// Separate entries with a blank, unowned line so they stay visually
-		// distinct without being attributed to (or made clickable for) any agent.
-		if len(bodyLines) > 0 {
-			add("", "")
+		name := entry.agent.TeamName
+		if name == "" {
+			name = "Team"
 		}
-		current := entry.agent.Name == currentAgent
-		for _, line := range renderAgent(entry.agent, entry.index, current) {
-			add(line, entry.agent.Name)
+		idx, ok := indexByName[name]
+		if !ok {
+			idx = len(groups)
+			indexByName[name] = idx
+			groups = append(groups, group{name: name})
+		}
+		groups[idx].entries = append(groups[idx].entries, entry)
+	}
+
+	var sections []string
+	var owners []string
+	for _, teamGroup := range groups {
+		var lines []string
+		for i, entry := range teamGroup.entries {
+			if i > 0 {
+				lines = append(lines, "")
+				owners = append(owners, "")
+			}
+			current := entry.agent.Name == currentAgent
+			owner := entry.agent.Name
+			if entry.agent.Internal {
+				owner = ""
+			}
+			for _, line := range renderAgent(entry.agent, entry.publicIndex, current) {
+				lines = append(lines, line)
+				owners = append(owners, owner)
+			}
+		}
+		sections = append(sections, m.renderTab(teamGroup.name, strings.Join(lines, "\n"), contentWidth))
+		// Between one tab body's last line and the next tab body there is the
+		// join separator, then the next tab's title and top padding: three
+		// non-clickable rendered lines.
+		if len(sections) < len(groups) {
+			owners = append(owners, "", "", "")
 		}
 	}
-	// The visible transfer presentation renders as a compact box below the
-	// whole roster, after a blank breathing line; every one of its lines is
-	// unowned so the box stays unclickable.
 	if pres, ok := m.visibleTransfer(); ok {
-		add("", "")
+		var lines []string
 		for _, line := range m.renderTransferPanel(pres, contentWidth) {
-			add(line, "")
+			lines = append(lines, line)
+			owners = append(owners, "")
+		}
+		sections = append(sections, strings.Join(lines, "\n"))
+	}
+	m.agentLineOwners = owners
+	return strings.Join(sections, "\n\n")
+}
+
+func (m *model) renderLegacyAgentTab(roster []rosterAgent, contentWidth int, currentAgent string) string {
+	title := "Agent"
+	if len(roster) > 1 {
+		title = "Agents"
+	}
+	if m.delegationInFlight() {
+		title += " ↔"
+	}
+	renderAgent := m.compactAgentRenderer(roster, contentWidth)
+	if m.agentInfoMode == AgentInfoDetailed {
+		renderAgent = m.detailedAgentRenderer(roster, contentWidth)
+	}
+	var lines, owners []string
+	for _, entry := range roster {
+		if len(lines) > 0 {
+			lines = append(lines, "")
+			owners = append(owners, "")
+		}
+		for _, line := range renderAgent(entry.agent, entry.publicIndex, entry.agent.Name == currentAgent) {
+			lines = append(lines, line)
+			owners = append(owners, entry.agent.Name)
+		}
+	}
+	if pres, ok := m.visibleTransfer(); ok {
+		lines = append(lines, "")
+		owners = append(owners, "")
+		for _, line := range m.renderTransferPanel(pres, contentWidth) {
+			lines = append(lines, line)
+			owners = append(owners, "")
 		}
 	}
 	m.agentLineOwners = owners
+	return m.renderTab(title, strings.Join(lines, "\n"), contentWidth)
+}
 
-	return m.renderTab(agentTitle, strings.Join(bodyLines, "\n"), contentWidth)
+func agentDisplayName(a runtime.AgentDetails) string {
+	if a.DisplayName != "" {
+		return a.DisplayName
+	}
+	return a.Name
 }
 
 // agentRenderer renders one roster agent's content lines at a layout
@@ -2142,8 +2218,8 @@ type agentRenderer func(agent runtime.AgentDetails, index int, current bool) []s
 // original team index, preserved under filtering so the ^N switch shortcut
 // keeps addressing the same team position.
 type rosterAgent struct {
-	agent runtime.AgentDetails
-	index int
+	agent       runtime.AgentDetails
+	publicIndex int
 }
 
 // rosterAgents returns the agents the Agents section presents, each with its
@@ -2153,11 +2229,20 @@ type rosterAgent struct {
 // switching still operate on the full team.
 func (m *model) rosterAgents() []rosterAgent {
 	roster := make([]rosterAgent, 0, len(m.availableAgents))
-	for i, agent := range m.availableAgents {
+	publicIndex := 0
+	for _, agent := range m.availableAgents {
 		if m.activeAgentsOnly && !m.agentActiveInSession(agent.Name) {
+			if !agent.Internal {
+				publicIndex++
+			}
 			continue
 		}
-		roster = append(roster, rosterAgent{agent: agent, index: i})
+		idx := -1
+		if !agent.Internal {
+			idx = publicIndex
+			publicIndex++
+		}
+		roster = append(roster, rosterAgent{agent: agent, publicIndex: idx})
 	}
 	return roster
 }
@@ -2425,7 +2510,7 @@ func (m *model) renderAgentLine(agent runtime.AgentDetails, index, contentWidth,
 	case current:
 		marker = agentStyle.Render("▶")
 	}
-	left := padRight(marker, agentMarkerWidth) + agentStyle.Render(toolcommon.TruncateText(agent.Name, nameWidth))
+	left := padRight(marker, agentMarkerWidth) + agentStyle.Render(toolcommon.TruncateText(agentDisplayName(agent), nameWidth))
 
 	badge, compact := thinkingBadge(agent.Thinking)
 	if glyphOnly {
@@ -2490,7 +2575,7 @@ func (m *model) renderAgentCard(agent runtime.AgentDetails, index, contentWidth,
 	case current:
 		marker = agentStyle.Render("▶")
 	}
-	left := padRight(marker, agentMarkerWidth) + agentStyle.Render(toolcommon.TruncateText(agent.Name, nameWidth))
+	left := padRight(marker, agentMarkerWidth) + agentStyle.Render(toolcommon.TruncateText(agentDisplayName(agent), nameWidth))
 
 	var shortcut string
 	if index >= 0 && index < 9 {

@@ -11,6 +11,7 @@ func (f *runExecFlags) loadTeamRequest(agentSource config.Source) runtime.LoadTe
 		Source:         agentSource,
 		ModelOverrides: f.modelOverrides,
 		PromptFiles:    f.promptFiles,
+		ExternalTeams:  f.teams,
 		RunConfig:      &f.runConfig,
 	}
 }

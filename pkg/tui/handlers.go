@@ -394,7 +394,7 @@ func (m *appModel) handleShowAgentDetails(agentName string) (tea.Model, tea.Cmd)
 }
 
 func (m *appModel) handleCycleAgent() (tea.Model, tea.Cmd) {
-	availableAgents := m.sessionState.AvailableAgents()
+	availableAgents := publicAgents(m.sessionState.AvailableAgents())
 	if len(availableAgents) <= 1 {
 		return m, notification.InfoCmd("No other agents available")
 	}
@@ -410,7 +410,7 @@ func (m *appModel) handleCycleAgent() (tea.Model, tea.Cmd) {
 }
 
 func (m *appModel) handleSwitchToAgentByIndex(index int) (tea.Model, tea.Cmd) {
-	availableAgents := m.sessionState.AvailableAgents()
+	availableAgents := publicAgents(m.sessionState.AvailableAgents())
 	if index >= 0 && index < len(availableAgents) {
 		agentName := availableAgents[index].Name
 		if agentName != m.sessionState.CurrentAgentName() {
@@ -418,6 +418,16 @@ func (m *appModel) handleSwitchToAgentByIndex(index int) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func publicAgents(agents []runtime.AgentDetails) []runtime.AgentDetails {
+	out := make([]runtime.AgentDetails, 0, len(agents))
+	for _, a := range agents {
+		if !a.Internal {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // --- Toggles ---

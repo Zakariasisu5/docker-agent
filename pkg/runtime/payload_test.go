@@ -14,6 +14,7 @@ func TestLoadTeamRequest_RoundTrip(t *testing.T) {
 	in := LoadTeamRequest{
 		ModelOverrides: []string{"openai/gpt-4o", "anthropic/claude-3-5-sonnet-20240620"},
 		PromptFiles:    []string{"prompts/role.md", "prompts/tone.md"},
+		ExternalTeams:  []string{"specialists:./secondary.yaml", "./qa.hcl"},
 	}
 
 	data, err := json.Marshal(in)
@@ -24,6 +25,7 @@ func TestLoadTeamRequest_RoundTrip(t *testing.T) {
 
 	assert.Equal(t, in.ModelOverrides, out.ModelOverrides)
 	assert.Equal(t, in.PromptFiles, out.PromptFiles)
+	assert.Equal(t, in.ExternalTeams, out.ExternalTeams)
 }
 
 func TestLoadTeamRequest_OmitsEmptyFields(t *testing.T) {
