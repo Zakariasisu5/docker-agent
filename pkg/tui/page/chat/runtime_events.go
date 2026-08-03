@@ -117,6 +117,9 @@ func (p *chatPage) handleRuntimeEvent(msg tea.Msg) (bool, tea.Cmd) {
 
 	case *runtime.AgentInfoEvent:
 		sidebarCmd := p.sidebar.SetAgentInfo(msg.AgentName, msg.Model, msg.Description, msg.ContextLimit, msg.CompactionModel, msg.PrimaryContextLimit)
+		if msg.WelcomeMessage != "" {
+			p.showBanner = false
+		}
 		p.messages.AddWelcomeMessage(msg.WelcomeMessage)
 		return true, sidebarCmd
 

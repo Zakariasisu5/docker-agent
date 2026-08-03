@@ -577,6 +577,10 @@ var (
 				Italic(true)
 )
 
+// AccentStyle renders text in the accent colour, used by the startup banner
+// and other places that need a bold accent without additional framing.
+var AccentStyle = BaseStyle.Foreground(Accent).Bold(true)
+
 // Deprecated styles (kept for backward compatibility)
 var (
 	ChatStyle = BaseStyle

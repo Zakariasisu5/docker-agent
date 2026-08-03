@@ -254,6 +254,10 @@ type chatPage struct {
 	// shifts (e.g. the collapsed sidebar band growing when async startup info
 	// arrives) that would otherwise leave mouse hit-testing offset.
 	appliedLayout sidebarLayout
+
+	// showBanner is false once the session has messages or the agent emits
+	// its own welcome_message, suppressing the startup banner.
+	showBanner bool
 }
 
 // sidebarHidden reports whether the sidebar should be omitted entirely from
@@ -368,6 +372,7 @@ func New(ar *animation.Runtime, ctx context.Context, a *app.App, sessionState *s
 		keyMap:        defaultKeyMap(),
 		commandParser: commands.NewParser(),
 		sessionState:  sessionState,
+		showBanner:    true,
 	}
 
 	for _, opt := range opts {
@@ -456,6 +461,7 @@ func (p *chatPage) Init() tea.Cmd {
 	if sess := p.app.Session(); sess != nil {
 		p.sidebar.LoadFromSession(sess)
 		if len(sess.Messages) > 0 {
+			p.showBanner = false
 			cmds = append(cmds, p.messages.LoadFromSession(sess))
 		}
 	}
@@ -693,6 +699,12 @@ func (p *chatPage) View() string {
 
 	messagesView := p.messages.View()
 
+	// Show the startup banner when the session is empty and no welcome
+	// message has been received from the agent.
+	if p.showBanner {
+		messagesView = p.renderBanner(sl.chatWidth, sl.chatHeight, messagesView)
+	}
+
 	var bodyContent string
 
 	switch sl.mode {
@@ -748,6 +760,25 @@ func (p *chatPage) View() string {
 		appStyle = appStyle.Height(p.height)
 	}
 	return appStyle.Render(bodyContent)
+}
+
+// renderBanner overlays the startup ASCII-art banner centered in the chat
+// area when the session is empty.
+func (p *chatPage) renderBanner(width, height int, base string) string {
+	lines := strings.Split(startupBanner, "\n")
+	bannerHeight := len(lines)
+	if bannerHeight > height {
+		return base
+	}
+	topPad := (height - bannerHeight) / 2
+	padded := make([]string, topPad+bannerHeight)
+	for i := range topPad {
+		padded[i] = ""
+	}
+	for i, line := range lines {
+		padded[topPad+i] = styles.AccentStyle.Width(width).Align(lipgloss.Center).Render(line)
+	}
+	return lipgloss.JoinVertical(lipgloss.Top, padded...)
 }
 
 // renderSidebarHandle renders the sidebar toggle/resize handle.
@@ -1163,6 +1194,8 @@ func (p *chatPage) processMessage(msg msgtypes.SendMsg) tea.Cmd {
 			return cmd
 		}
 	}
+
+	p.showBanner = false
 
 	if isBangCommand(msg.Content) {
 		p.app.RunBangCommand(p.ctx(), msg.Content[1:])
