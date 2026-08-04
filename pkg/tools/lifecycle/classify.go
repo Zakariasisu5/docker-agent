@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -82,7 +83,8 @@ func classifyByMessage(err error) error {
 		// call is treated as an application failure and never retried, even
 		// though a reconnect gives it a fresh stream that typically succeeds.
 		strings.Contains(lower, "request terminated without response"),
-		strings.Contains(msg, "EOF"):
+		strings.Contains(msg, "EOF"),
+		hasTransientHTTPStatus(msg):
 		return wrap(ErrTransport, err)
 	// Map server-side OAuth token rejection to ErrAuthRequired. We match
 	// "invalid_token" (RFC 6750 §3.1 canonical error code) and its space-
@@ -95,6 +97,37 @@ func classifyByMessage(err error) error {
 		return wrap(ErrAuthRequired, err)
 	}
 	return err
+}
+
+// transientHTTPStatusTexts are the status lines the MCP SDK's streamable
+// client reports for the HTTP statuses it itself defines as transient. It
+// wraps them as "rejected by transport" precisely so the connection stays
+// usable and the request can be retried, but the status reaches the caller as
+// nothing but http.StatusText in the message — so this is the only way to tell
+// a busy or cold-starting server from an application error.
+//
+// Matched case-sensitively: these are canonical http.StatusText values, and
+// folding case would classify ordinary prose containing the same words.
+var transientHTTPStatusTexts = []string{
+	http.StatusText(http.StatusInternalServerError),
+	http.StatusText(http.StatusBadGateway),
+	http.StatusText(http.StatusServiceUnavailable),
+	http.StatusText(http.StatusGatewayTimeout),
+	http.StatusText(http.StatusTooManyRequests),
+}
+
+// hasTransientHTTPStatus reports whether msg carries one of the transient HTTP
+// status lines. A remote MCP server behind a gateway answers this way while it
+// is cold-starting or shedding load; treating it as permanent costs the caller
+// the whole toolset for the rest of the session over a condition that clears
+// on its own.
+func hasTransientHTTPStatus(msg string) bool {
+	for _, status := range transientHTTPStatusTexts {
+		if strings.Contains(msg, status) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsTransient reports whether err wraps a sentinel that warrants a retry.

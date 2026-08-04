@@ -74,10 +74,38 @@ func TestClassify_TransportByMessage(t *testing.T) {
 		// error and every post-handshake stream termination failed the tool
 		// call outright.
 		`calling "tools/call": request terminated without response`,
+		// A transient HTTP status from the server or an intermediary. The SDK
+		// keeps the connection usable for exactly this reason, but surfaces the
+		// status as bare http.StatusText, so without these patterns a gateway
+		// that is cold-starting or shedding load permanently drops the toolset
+		// for the session.
+		`rejected by transport: sending "tools/list": Gateway Timeout`,
+		`rejected by transport: sending "tools/call": Service Unavailable`,
+		`rejected by transport: sending "tools/list": Bad Gateway`,
+		`rejected by transport: sending "tools/call": Too Many Requests`,
+		`rejected by transport: sending "initialize": Internal Server Error`,
 	}
 	for _, msg := range cases {
 		got := lifecycle.Classify(errors.New(msg))
 		assert.Check(t, errors.Is(got, lifecycle.ErrTransport), "msg=%q", msg)
+	}
+}
+
+// TestClassify_NonTransientHTTPStatusUnchanged keeps the status matching from
+// swallowing failures a retry cannot fix: a permanent 4xx must stay unclassified
+// so the caller reports it instead of reconnecting into the same answer.
+func TestClassify_NonTransientHTTPStatusUnchanged(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		`rejected by transport: sending "tools/list": Forbidden`,
+		`rejected by transport: sending "tools/list": Not Implemented`,
+		`sending "tools/list": Bad Request`,
+	}
+	for _, msg := range cases {
+		in := errors.New(msg)
+		got := lifecycle.Classify(in)
+		assert.Check(t, got == in, "msg=%q", msg)
+		assert.Check(t, !lifecycle.IsTransient(got), "msg=%q", msg)
 	}
 }
 
