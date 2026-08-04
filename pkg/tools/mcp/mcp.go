@@ -658,33 +658,47 @@ func (ts *Toolset) Tools(ctx context.Context) ([]tools.Tool, error) {
 
 	slog.DebugContext(ctx, "Listing MCP tools (cache miss)", "server", ts.logID)
 
-	resp := ts.mcpClient.ListTools(ctx, &mcp.ListToolsParams{})
+	list := func() ([]tools.Tool, error) {
+		resp := ts.mcpClient.ListTools(ctx, &mcp.ListToolsParams{})
+		var toolsList []tools.Tool
+		for t, err := range resp {
+			if err != nil {
+				return nil, err
+			}
 
-	var toolsList []tools.Tool
-	for t, err := range resp {
-		if err != nil {
-			return nil, err
-		}
+			name := t.Name
+			if ts.name != "" {
+				name = fmt.Sprintf("%s_%s", ts.name, name)
+			}
 
-		name := t.Name
-		if ts.name != "" {
-			name = fmt.Sprintf("%s_%s", ts.name, name)
-		}
+			tool := tools.Tool{
+				Name:         name,
+				Category:     "mcp",
+				Description:  t.Description,
+				Parameters:   t.InputSchema,
+				OutputSchema: t.OutputSchema,
+				Handler:      ts.callTool,
+			}
+			if t.Annotations != nil {
+				tool.Annotations = tools.ToolAnnotations(*t.Annotations)
+			}
+			toolsList = append(toolsList, tool)
 
-		tool := tools.Tool{
-			Name:         name,
-			Category:     "mcp",
-			Description:  t.Description,
-			Parameters:   t.InputSchema,
-			OutputSchema: t.OutputSchema,
-			Handler:      ts.callTool,
+			slog.DebugContext(ctx, "Added MCP tool", "tool", name)
 		}
-		if t.Annotations != nil {
-			tool.Annotations = tools.ToolAnnotations(*t.Annotations)
-		}
-		toolsList = append(toolsList, tool)
+		return toolsList, nil
+	}
 
-		slog.DebugContext(ctx, "Added MCP tool", "tool", name)
+	toolsList, err := list()
+	if err != nil && isConnectionError(err) && ctx.Err() == nil {
+		slog.WarnContext(ctx, "MCP tools/list failed, forcing reconnect and retrying", "server", ts.logID, "error", err)
+		if waitErr := ts.supervisor.RestartAndWait(ctx, sessionMissingRetryTimeout); waitErr != nil {
+			return nil, fmt.Errorf("failed to reconnect after tools/list failure: %w", waitErr)
+		}
+		toolsList, err = list()
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	slog.DebugContext(ctx, "Listed MCP tools", "count", len(toolsList), "server", ts.logID)
