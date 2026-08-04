@@ -69,7 +69,6 @@ docker agent new
 
 # Run your own config
 docker agent run agent.yaml
-```
 
 More examples in the [`examples/`](examples/README.md) directory.
 
