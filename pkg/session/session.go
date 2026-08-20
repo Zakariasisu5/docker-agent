@@ -90,6 +90,39 @@ func (p SafetyPolicy) Normalize() SafetyPolicy {
 	}
 }
 
+// MinSafetyPolicy returns the more restrictive of two concrete safety modes.
+// Under NonInteractive, strict and balanced deny calls that need confirmation,
+// restricted permits only classifier-safe calls, and autonomous never asks.
+// Empty is an unset legacy mode rather than an ordered policy, so an empty input
+// yields empty; callers applying a policy ceiling must handle it explicitly.
+func MinSafetyPolicy(a, b SafetyPolicy) SafetyPolicy {
+	a = a.Normalize()
+	b = b.Normalize()
+	if a == "" || b == "" {
+		return ""
+	}
+
+	if safetyPolicyRank(a) <= safetyPolicyRank(b) {
+		return a
+	}
+	return b
+}
+
+func safetyPolicyRank(policy SafetyPolicy) int {
+	switch policy {
+	case SafetyPolicyStrict:
+		return 0
+	case SafetyPolicyBalanced:
+		return 1
+	case SafetyPolicyRestricted:
+		return 2
+	case SafetyPolicyAutonomous:
+		return 3
+	default:
+		return 0
+	}
+}
+
 // IsValid accepts current values, the legacy aliases, and empty.
 func (p SafetyPolicy) IsValid() bool {
 	switch p {
@@ -234,6 +267,9 @@ type Session struct {
 
 	// ID is the unique identifier for the session
 	ID string `json:"id"`
+
+	// Origin identifies the protocol surface that created this session.
+	Origin string `json:"origin,omitempty"`
 
 	// InputID is an optional caller-supplied correlation ID read from the eval
 	// input file's "input_id" field. It is carried through to the output as-is
@@ -1402,6 +1438,12 @@ func WithMaxToolResultTokens(n int) Opt {
 	}
 }
 
+func WithOrigin(origin string) Opt {
+	return func(s *Session) {
+		s.Origin = origin
+	}
+}
+
 func WithWorkingDir(workingDir string) Opt {
 	return func(s *Session) {
 		s.WorkingDir = workingDir
@@ -1816,6 +1858,7 @@ func (s *Session) newID() string {
 // New creates a new agent session
 func New(opts ...Opt) *Session {
 	s := &Session{
+		Origin:          "run",
 		SendUserMessage: true,
 	}
 

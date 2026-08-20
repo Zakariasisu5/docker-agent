@@ -264,13 +264,8 @@ func (f *runExecFlags) runRunCommand(cmd *cobra.Command, args []string) (command
 		}
 	}
 
-	// Same early-failure treatment for --safety: a typo must not
-	// silently collapse to strict. Legacy policy aliases are a wire
-	// compat concern; the new flag only takes the canonical modes.
-	switch session.SafetyPolicy(f.safety) {
-	case "", session.SafetyPolicyStrict, session.SafetyPolicyBalanced, session.SafetyPolicyRestricted, session.SafetyPolicyAutonomous:
-	default:
-		return fmt.Errorf("invalid --safety value %q (valid: strict, balanced, restricted, autonomous)", f.safety)
+	if err := validateSafetyFlag(f.safety); err != nil {
+		return err
 	}
 	f.safetyChanged = cmd.Flags().Changed("safety")
 	f.yoloChanged = cmd.Flags().Changed("yolo")
@@ -1356,6 +1351,16 @@ func stopToolSets(ctx context.Context, t toolStopper) {
 	defer cancel()
 	if err := t.StopToolSets(ctx); err != nil {
 		slog.ErrorContext(ctx, "Failed to stop tool sets", "error", err)
+	}
+}
+
+// validateSafetyFlag rejects non-canonical --safety values consistently across commands.
+func validateSafetyFlag(value string) error {
+	switch session.SafetyPolicy(value) {
+	case "", session.SafetyPolicyStrict, session.SafetyPolicyBalanced, session.SafetyPolicyRestricted, session.SafetyPolicyAutonomous:
+		return nil
+	default:
+		return fmt.Errorf("invalid --safety value %q (valid: strict, balanced, restricted, autonomous)", value)
 	}
 }
 

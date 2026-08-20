@@ -415,9 +415,7 @@ func (r *LocalRuntime) runStreamLoop(ctx context.Context, sess *session.Session,
 	sink.Emit(StreamStarted(sess.ID, a.Name()))
 
 	if a.HasHarness() {
-		streamReason = r.runHarnessAgent(ctx, sess, a,
-			slices.Concat(ls.sessionStartMsgs, ls.userPromptMsgs),
-			slices.Concat(ls.sessionStartLegacyMsgs, ls.userPromptMsgs), ls.sessionStartSources, sink)
+		streamReason = r.runHarnessAgent(ctx, sess, a, sink)
 		return
 	}
 

@@ -318,6 +318,9 @@ $ docker agent serve mcp <config> [flags]
 | `-a, --agent <name>`   | (all agents)       | Name of the agent to expose. If omitted, every agent in the config is exposed as a separate tool. |
 | `--tool-name <name>`   | (agent name)       | Override the MCP tool identifier clients call; only valid when exposing a single agent.           |
 | `--http`               | `false`            | Use streaming HTTP transport instead of stdio.                                                    |
+| `--safety <policy>`    | `restricted`       | HTTP MCP safety policy; no effect on stdio or `--attach`.                                         |
+| `--auth-token <token>` | (none)             | Required Bearer token for HTTP MCP requests.                                                       |
+| `--insecure-no-auth`   | `false`            | Permit unauthenticated non-loopback HTTP MCP binding.                                              |
 | `-l, --listen <addr>`  | `127.0.0.1:8081`   | Address to listen on (only used with `--http`).                                                   |
 | `--mcp-keepalive <dur>`| `0` (disabled)     | Interval between MCP keep-alive pings (e.g. `30s`).                                               |
 | `--attach [target]`    | (none)             | Attach to a running TUI run by pid, address, or session id; given without a value, selects the most recent run.   |
@@ -346,6 +349,10 @@ $ docker agent serve a2a <config> [flags]
 | ---------------------- | ------------------ | ------------------------------------------------------------------------------------------ |
 | `-a, --agent <name>`   | (team default)     | Name of the agent to run. Defaults to the team's first agent if not specified.             |
 | `-l, --listen <addr>`  | `127.0.0.1:8082`   | Address to listen on.                                                                       |
+| `--auth-token <token>` | (none)             | Bearer token required for agent-card and invocation requests.                              |
+| `--cors-origin <origins>` | (none)          | Allowed browser origins, comma-separated; empty disables CORS.                             |
+| `--insecure-no-auth`   | `false`            | Allow an unauthenticated non-loopback listener (unsafe).                                   |
+| `--safety <policy>`    | `restricted`       | Tool safety policy; `autonomous` is permitted only through this explicit CLI flag.         |
 | `-s, --session-db <path>` | `<data-dir>/session.db` | Path to the SQLite session database.                                                 |
 
 All [runtime configuration flags](#runtime-configuration-flags) are also accepted.
@@ -394,7 +401,9 @@ $ docker agent serve chat <config> [flags]
 | `-l, --listen <addr>`         | `127.0.0.1:8083`   | Address to listen on.                                                                                             |
 | `--cors-origin <origin>`      | (none)             | Allowed CORS origin (e.g. `https://example.com`). Empty disables CORS.                                            |
 | `--api-key <token>`           | (none)             | Required Bearer token clients must present (`Authorization: Bearer <token>`). Empty disables auth.                |
-| `--api-key-env <name>`        | (none)             | Read the API key from this environment variable instead of the command line.                                      |
+| `--api-key-env <name>`        | (none)             | Read the required API key from this non-empty environment variable.                                      |
+| `--insecure-no-auth`           | `false`            | Permit unauthenticated non-loopback binding.                                                                  |
+| `--safety <policy>`            | `restricted`       | Tool safety policy; CLI value overrides agent/runtime configuration.                                           |
 | `--max-request-size <bytes>`  | `1048576` (1 MiB)  | Maximum request body size. Requests exceeding this limit are rejected with HTTP 413 — see [Troubleshooting: HTTP 413](../../community/troubleshooting/index.md#http-413-request-body-too-large).                                                                                        |
 | `--request-timeout <dur>`     | `5m`               | Per-request timeout (covers model + tool calls + streaming).                                                      |
 | `--conversations-max <n>`     | `0`                | Cache up to N conversations server-side, keyed by `X-Conversation-Id`. `0` disables — clients must resend history. |
@@ -449,6 +458,48 @@ $ docker agent share pull docker.io/username/my-agent:latest --force
 
 See [Agent Distribution](../../concepts/distribution/index.md) for full registry workflow details.
 
+### `docker agent sessions diff`
+
+Compare two recorded sessions and report the first point where the agent behaved
+differently — the triage answer when a task that worked yesterday does not work
+today.
+
+```bash
+$ docker agent sessions diff <session-a> <session-b> [flags]
+```
+
+```console
+$ docker agent sessions diff -1 -2
+Comparing a1b2c3d4 (7 turns) against e5f6a7b8 (9 turns)
+
+❌ First divergence at turn 3 (after 3 matching turn(s)).
+   a1b2c3d4 called:
+     read_file({"path":"pkg/cache/cache.go"})
+   e5f6a7b8 called:
+     search_files_content({"query":"persistToDisk","path":"."})
+
+Everything after this point is downstream of the divergence and is not compared.
+```
+
+Session references accept a full ID, a unique ID prefix, or a relative form such
+as `-1` for the most recent run.
+
+| Flag                    | Default                 | Description                                    |
+| ----------------------- | ----------------------- | ------------------------------------------------ |
+| `-s, --session-db`      | `<data-dir>/session.db` | Path to the session database                   |
+| `--json`                | `false`                 | Emit the comparison as JSON                    |
+| `--fail-on-divergence`  | `false`                 | Exit non-zero when the two sessions diverge    |
+
+Comparison is over the sequence of tool calls, not the assistant's prose: model
+output is nondeterministic, so two runs of the same task almost always word
+things differently while doing the same work. Turns taken by delegated
+sub-agents are included in sequence. Reporting stops at the first divergence —
+everything after it is downstream of that difference.
+
+This locates *where* two runs diverged, not *why*. Re-running a session against
+a different model while holding the environment fixed is a separate, unbuilt
+feature.
+
 ### `docker agent eval`
 
 Run agent evaluations against a directory of recorded sessions.
@@ -468,6 +519,8 @@ $ docker agent eval <agent-file>|<registry-ref> [<eval-dir>|./evals] [flags]
 | `--keep-containers` | `false`                              | Keep containers after evaluation (don't remove with `--rm`)                |
 | `-e, --env`         | (none)                               | Environment variables to pass to container (`KEY` or `KEY=VALUE`, repeatable) |
 | `--repeat <n>`      | `1`                                  | Number of times to repeat each evaluation (useful for computing baselines) |
+| `--baseline <file>` | (none)                               | Compare against a previously saved run JSON (`<output>/<run>.json`) and exit non-zero on regression |
+| `--regression-tolerance <n>` | `0`                         | How far an aggregate quality rate may fall before `--baseline` reports a regression (0–1) |
 
 All [runtime configuration flags](#runtime-configuration-flags) are also accepted.
 
